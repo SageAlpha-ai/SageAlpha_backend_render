@@ -1,0 +1,73 @@
+# ========================
+# Node.js
+# ========================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ========================
+# Environment variables
+# ========================
+.env
+.env.*
+!.env.example
+!.env.node.example
+
+# ========================
+# Logs & Debug
+# ========================
+logs/
+debug
+*.log
+
+# ========================
+# Generated / Runtime data
+# ========================
+generated_reports/
+uploads/
+vector_store_data/
+
+# ========================
+# Database files
+# ========================
+*.db
+*.sqlite
+*.sqlite3
+sagealpha
+
+# ========================
+# OS / Editor files
+# ========================
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# ========================
+# Build / Cache
+# ========================
+dist/
+build/
+.cache/
+
+# ========================
+# Playwright Browsers (HUGE - Do NOT commit!)
+# ========================
+# Playwright
+playwright-browsers/
+**/playwright-browsers/
+.chromium/
+.chromium-*
+
+
+# ========================
+# Azure / Deployment
+# ========================
+.azure/
+
+# ========================
+# Misc
+# ========================
+txt
+VERSION
