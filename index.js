@@ -182,7 +182,7 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
   : IS_PRODUCTION
     ? [] // Production MUST set ALLOWED_ORIGINS
-    : ["http://localhost:5173", "http://localhost:3000"]; // Dev fallback
+    : ["http://localhost:5173", "http://localhost:3000","http://localhost:5174"]; // Dev fallback
 
 if (IS_PRODUCTION && allowedOrigins.length === 0) {
   console.warn('[CORS] WARNING: ALLOWED_ORIGINS not set in production! CORS may fail.');

@@ -60,6 +60,7 @@ html, body {
   margin: 0 auto;
   padding: 28px;
   box-sizing: border-box;
+  page-break-inside: auto; /* Allow content to break naturally */
 }
 
 /* HEADER */
@@ -68,6 +69,8 @@ html, body {
   border-bottom: 3px solid #083154;
   padding-bottom: 10px;
   margin-bottom: 12px;
+  page-break-after: avoid; /* Keep header with content */
+  page-break-inside: avoid; /* Keep header together */
 }
 
 .header-row {
@@ -99,12 +102,18 @@ html, body {
   width: 100%;
   table-layout: fixed; /* 🔒 Prevents shrinking */
   border-spacing: 0;
+  page-break-inside: auto; /* Allow table to break across pages */
+}
+
+.columns-table tr {
+  page-break-inside: auto; /* Allow rows to break if needed */
 }
 
 .col-left {
   width: 65%;
   vertical-align: top;
   padding-right: 20px;
+  page-break-inside: auto; /* Allow left column to break naturally */
 }
 
 .col-right {
@@ -112,9 +121,14 @@ html, body {
   vertical-align: top;
   padding-left: 20px;
   border-left: 1.5px solid #e0e0e0;
+  page-break-inside: auto; /* Allow right column to break naturally */
 }
 
 .sidebar-col {
+  /* Allow sidebar to break if content is too long, but try to keep recommendation box together */
+}
+
+.recommendation-box {
   page-break-inside: avoid;
   break-inside: avoid;
   -webkit-region-break-inside: avoid;
@@ -147,10 +161,20 @@ html, body {
   text-transform: uppercase;
   color: #083154;
   border-bottom: 2px solid #083154;
+  page-break-after: avoid; /* Keep title with its content */
 }
 
-ul { padding-left: 18px; margin: 0; }
-li { font-size: 12px; margin-bottom: 8px; line-height: 1.5; }
+ul { 
+  padding-left: 18px; 
+  margin: 0; 
+  page-break-inside: auto; /* Allow lists to break across pages */
+}
+li { 
+  font-size: 12px; 
+  margin-bottom: 8px; 
+  line-height: 1.5;
+  page-break-inside: avoid; /* Keep list items together */
+}
 
 /********** SIDEBAR **********/
 .recommendation-box {
@@ -210,6 +234,7 @@ li { font-size: 12px; margin-bottom: 8px; line-height: 1.5; }
   padding-top: 8px;
   border-top: 1px solid #d0d0d0;
   color: #555;
+  page-break-inside: avoid; /* Keep footer together */
 }
 
 </style>

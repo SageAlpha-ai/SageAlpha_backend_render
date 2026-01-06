@@ -192,6 +192,7 @@ async function convertHtmlToPdf(htmlContent) {
       `--print-media-type`,           // Use print media type for better CSS rendering
       `--no-outline`,                 // Disable PDF outline
       `--enable-local-file-access`,   // Allow local file access (for embedded images)
+      `--enable-forms`,               // Enable forms support
       `--quiet`                       // Suppress warnings
     ];
 
