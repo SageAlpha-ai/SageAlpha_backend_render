@@ -129,8 +129,110 @@ async function deleteHtmlFromBlob(reportId) {
   }
 }
 
+/**
+ * Upload PDF buffer to Azure Blob Storage
+ * @param {string} reportId - Report ID (without .pdf extension)
+ * @param {Buffer} pdfBuffer - PDF content as Buffer
+ * @returns {Promise<string>} - Blob file name (reportId.pdf)
+ */
+async function uploadPdfToBlob(reportId, pdfBuffer) {
+  try {
+    const container = await ensureContainerExists();
+    const blobName = `${reportId}.pdf`;
+    const blockBlobClient = container.getBlockBlobClient(blobName);
+
+    await blockBlobClient.upload(pdfBuffer, pdfBuffer.length, {
+      blobHTTPHeaders: { 
+        blobContentType: "application/pdf" 
+      }
+    });
+
+    console.log(`[BlobStorage] Uploaded PDF to blob: ${blobName}`);
+    return blobName; // Return just the filename
+  } catch (error) {
+    console.error(`[BlobStorage] Error uploading PDF to blob:`, error.message);
+    throw new Error(`Failed to upload PDF to blob storage: ${error.message}`);
+  }
+}
+
+/**
+ * Get public/signed URL for a blob (PDF or HTML)
+ * @param {string} blobName - Blob name (e.g., "reportId.pdf" or "reportId.html")
+ * @param {number} expiryHours - URL expiry in hours (default: 24)
+ * @returns {Promise<string>} - Public URL to the blob
+ */
+async function getBlobUrl(blobName, expiryHours = 24) {
+  try {
+    const container = await ensureContainerExists();
+    const blockBlobClient = container.getBlockBlobClient(blobName);
+
+    // Check if blob exists
+    const exists = await blockBlobClient.exists();
+    if (!exists) {
+      throw new Error(`Blob not found: ${blobName}`);
+    }
+
+    // Generate SAS (Shared Access Signature) URL with read permissions
+    // This works even if the container is private
+    const { BlobSASPermissions, StorageSharedKeyCredential, generateBlobSASQueryParameters } = require('@azure/storage-blob');
+    
+    const expiresOn = new Date();
+    expiresOn.setHours(expiresOn.getHours() + expiryHours);
+
+    // Extract account name and key from connection string
+    const accountNameMatch = CONNECTION_STRING.match(/AccountName=([^;]+)/);
+    const accountKeyMatch = CONNECTION_STRING.match(/AccountKey=([^;]+)/);
+    
+    if (!accountNameMatch || !accountKeyMatch) {
+      // Fallback: return direct URL (works if container is public)
+      const directUrl = blockBlobClient.url;
+      console.warn(`[BlobStorage] Using direct URL (container must be public): ${directUrl}`);
+      return directUrl;
+    }
+
+    const accountName = accountNameMatch[1];
+    const accountKey = accountKeyMatch[1];
+
+    // Create shared key credential
+    const sharedKeyCredential = new StorageSharedKeyCredential(accountName, accountKey);
+
+    // Generate SAS query parameters
+    const sasQueryParams = generateBlobSASQueryParameters(
+      {
+        containerName: CONTAINER_NAME,
+        blobName: blobName,
+        permissions: BlobSASPermissions.parse('r'), // Read only
+        expiresOn: expiresOn
+      },
+      sharedKeyCredential
+    );
+
+    // Construct full URL with SAS token
+    const blobUrl = blockBlobClient.url;
+    const sasUrl = `${blobUrl}?${sasQueryParams.toString()}`;
+
+    console.log(`[BlobStorage] Generated SAS URL for ${blobName} (expires in ${expiryHours} hours)`);
+    return sasUrl;
+  } catch (error) {
+    console.error(`[BlobStorage] Error generating blob URL:`, error.message);
+    
+    // Fallback: try direct URL if container might be public
+    try {
+      const container = await ensureContainerExists();
+      const blockBlobClient = container.getBlockBlobClient(blobName);
+      const directUrl = blockBlobClient.url;
+      console.warn(`[BlobStorage] Using direct URL as fallback (may not work if container is private): ${directUrl}`);
+      return directUrl;
+    } catch (fallbackError) {
+      throw new Error(`Failed to generate blob URL: ${error.message}`);
+    }
+  }
+}
+
 module.exports = {
   uploadHtmlToBlob,
   getHtmlFromBlob,
-  deleteHtmlFromBlob
+  deleteHtmlFromBlob,
+  uploadPdfToBlob,
+  getBlobUrl
 };

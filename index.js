@@ -32,7 +32,8 @@ const fs = require("fs");
 const { OpenAI, AzureOpenAI } = require("openai");
 const { generateReportHtml } = require("./reportTemplate");
 const { convertHtmlToPdf } = require("./pdfGenerator");
-const { uploadHtmlToBlob, getHtmlFromBlob, deleteHtmlFromBlob } = require("./utils/blobStorage");
+const { uploadHtmlToBlob, getHtmlFromBlob, deleteHtmlFromBlob, uploadPdfToBlob, getBlobUrl } = require("./utils/blobStorage");
+const { sendWhatsAppReport } = require("./services/whatsapp.service");
 
 
 // Mongoose models (wilFl be required after connecting)
@@ -1177,10 +1178,12 @@ app.post("/subscribers/add", loginRequired, async (req, res) => {
         return res.status(400).json({ error: "Subscriber with this email already exists" });
       }
 
+      const phoneValue = mobile?.trim() || "";
       await Subscriber.create({
         user_id: userId,
         name: name.trim(),
-        mobile: mobile?.trim() || "",
+        mobile: phoneValue,
+        phone: phoneValue, // Sync phone field
         email: email.toLowerCase().trim(),
         risk_profile: riskProfile
       });
@@ -1232,11 +1235,13 @@ app.put("/subscribers/:id", loginRequired, async (req, res) => {
       }
 
       // Update subscriber
+      const phoneValue = mobile?.trim() || "";
       await Subscriber.updateOne(
         { _id: id, user_id: userId },
         {
           name: name.trim(),
-          mobile: mobile?.trim() || "",
+          mobile: phoneValue,
+          phone: phoneValue, // Sync phone field
           email: email.toLowerCase().trim(),
           risk_profile: riskProfile
         }
@@ -2263,6 +2268,167 @@ app.get("/subscribers/:id/history", loginRequired, async (req, res) => {
   } catch (err) {
     console.error("[Subscriber History] Error:", err.message);
     res.status(500).json({ error: "Failed to fetch report history" });
+  }
+});
+
+// Send report via WhatsApp
+app.post("/api/whatsapp/send-report", loginRequired, async (req, res) => {
+  const { subscriberId, phone, reportId } = req.body;
+  const userId = req.user._id ? req.user._id : req.user.id;
+
+  try {
+    // Validate input
+    if (!subscriberId || !phone || !reportId) {
+      return res.status(400).json({ 
+        error: "subscriberId, phone, and reportId are required" 
+      });
+    }
+
+    // Verify subscriber exists and belongs to user
+    let subscriber = null;
+    if (mongooseConnected) {
+      subscriber = await Subscriber.findOne({
+        _id: subscriberId,
+        user_id: userId,
+        is_active: true
+      });
+    } else {
+      subscriber = db.prepare(
+        "SELECT * FROM subscribers WHERE _id = ? AND user_id = ? AND is_active = 1"
+      ).get(subscriberId, userId);
+    }
+
+    if (!subscriber) {
+      return res.status(404).json({ error: "Subscriber not found or access denied" });
+    }
+
+    // Verify WhatsApp opt-in
+    if (subscriber.whatsappOptIn !== true) {
+      return res.status(400).json({ 
+        error: "Subscriber has not opted in for WhatsApp notifications" 
+      });
+    }
+
+    // Verify phone number matches
+    const subscriberPhone = subscriber.phone || subscriber.mobile || "";
+    const cleanedSubscriberPhone = subscriberPhone.replace(/[^\d]/g, '');
+    const cleanedRequestPhone = phone.replace(/[^\d]/g, '');
+    
+    // Normalize both phones (remove country code if present for comparison)
+    const normalizePhone = (phone) => {
+      const cleaned = phone.replace(/[^\d]/g, '');
+      return cleaned.length > 10 ? cleaned.slice(-10) : cleaned;
+    };
+
+    if (normalizePhone(cleanedSubscriberPhone) !== normalizePhone(cleanedRequestPhone)) {
+      console.warn(`[WhatsApp] Phone mismatch: subscriber has ${subscriberPhone}, request has ${phone}`);
+      // Don't block, but log warning
+    }
+
+    // Fetch report details
+    let report = null;
+    if (mongooseConnected) {
+      // Try finding by _id first
+      if (reportId.match(/^[0-9a-fA-F]{24}$/)) {
+        report = await Report.findOne({
+          _id: reportId,
+          user_id: userId
+        }).lean();
+      }
+      
+      // If not found, try finding by report_data
+      if (!report) {
+        report = await Report.findOne({
+          report_data: reportId,
+          user_id: userId
+        }).lean();
+      }
+    } else {
+      // SQLite fallback
+      report = db.prepare(
+        "SELECT * FROM reports WHERE (id = ? OR report_data = ?) AND user_id = ?"
+      ).get(reportId, reportId, userId);
+    }
+
+    if (!report) {
+      return res.status(404).json({ error: "Report not found or access denied" });
+    }
+
+    // Get safe report ID
+    const safeReportId = report.report_data || reportId;
+
+    // Get HTML content from blob storage
+    const htmlContent = await getHtmlFromBlob(safeReportId);
+    if (!htmlContent) {
+      return res.status(404).json({ error: "Report HTML not found in storage" });
+    }
+
+    // Generate PDF from HTML
+    console.log(`[WhatsApp] Generating PDF for report ${safeReportId}...`);
+    const pdfBuffer = await convertHtmlToPdf(htmlContent);
+    console.log(`[WhatsApp] PDF generated successfully (${pdfBuffer.length} bytes)`);
+
+    // Upload PDF to blob storage
+    const pdfBlobName = await uploadPdfToBlob(safeReportId, pdfBuffer);
+    console.log(`[WhatsApp] PDF uploaded to blob: ${pdfBlobName}`);
+
+    // Get public URL for PDF (valid for 24 hours)
+    const pdfUrl = await getBlobUrl(pdfBlobName, 24);
+    console.log(`[WhatsApp] PDF URL generated: ${pdfUrl.substring(0, 100)}...`);
+
+    // Extract report name
+    const reportName = report.title?.replace("Equity Research Note – ", "").trim() || 
+                      report.company_name || 
+                      "Report";
+
+    // Send WhatsApp message with PDF attachment
+    const result = await sendWhatsAppReport({
+      phone: phone.replace(/[^\d]/g, ''), // Format: 91XXXXXXXXXX (no +)
+      userName: subscriber.name,
+      reportName: reportName,
+      pdfUrl: pdfUrl // Public URL to PDF file
+    });
+
+    // Log delivery (optional - similar to email delivery logging)
+    try {
+      if (mongooseConnected) {
+        await ReportDelivery.create({
+          subscriber_id: subscriberId,
+          report_id: report._id || report.id,
+          user_id: userId,
+          delivery_method: 'whatsapp',
+          message_sid: result.messageSid
+        });
+      }
+    } catch (dbErr) {
+      console.warn("[WhatsApp] Failed to log delivery:", dbErr.message);
+      // Don't fail the request if logging fails
+    }
+
+    console.log(`[WhatsApp] Report sent successfully to ${subscriber.name} (${phone}). SID: ${result.messageSid}`);
+
+    return res.json({
+      success: true,
+      message: "Report sent on WhatsApp successfully",
+      messageSid: result.messageSid
+    });
+
+  } catch (err) {
+    console.error("[WhatsApp] Error sending report:", err);
+    
+    // Handle Twilio-specific errors
+    if (err.code) {
+      return res.status(400).json({
+        error: "Failed to send WhatsApp message",
+        code: err.code,
+        message: err.message
+      });
+    }
+
+    return res.status(500).json({
+      error: "Failed to send report on WhatsApp",
+      message: err.message || "Internal server error"
+    });
   }
 });
 
