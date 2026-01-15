@@ -34,6 +34,9 @@ const { generateReportHtml } = require("./reportTemplate");
 const { convertHtmlToPdf } = require("./pdfGenerator");
 const { uploadHtmlToBlob, getHtmlFromBlob, deleteHtmlFromBlob, uploadPdfToBlob, getBlobUrl } = require("./utils/blobStorage");
 const { sendWhatsAppReport } = require("./services/whatsapp.service");
+const { fetchMarketIntelligence } = require("./services/agenticIntelligenceService");
+const { normalizeMarketIntelligence } = require("./utils/normalizeMarketIntelligence");
+const marketIntelligenceCache = require("./utils/marketIntelligenceCache");
 
 
 // Mongoose models (wilFl be required after connecting)
@@ -2428,6 +2431,129 @@ app.post("/api/whatsapp/send-report", loginRequired, async (req, res) => {
     return res.status(500).json({
       error: "Failed to send report on WhatsApp",
       message: err.message || "Internal server error"
+    });
+  }
+});
+
+// ==========================================
+// 8.5. MARKET INTELLIGENCE ROUTES
+// ==========================================
+
+/**
+ * Helper function to map user/subscriber risk profile to agentic AI format
+ * @param {string} riskProfile - Risk profile from database ('Low', 'Medium', 'High')
+ * @returns {string} Normalized risk profile ('LOW', 'MODERATE', 'HIGH')
+ */
+function normalizeRiskProfileForAPI(riskProfile) {
+  if (!riskProfile) return 'MODERATE';
+  
+  const normalized = riskProfile.toUpperCase();
+  // Map database values to API values
+  if (normalized === 'LOW') return 'LOW';
+  if (normalized === 'MEDIUM') return 'MODERATE';
+  if (normalized === 'HIGH') return 'HIGH';
+  
+  // Default to MODERATE for unknown values
+  return 'MODERATE';
+}
+
+/**
+ * Get user's risk profile from preferences or use default
+ * @param {string} userId - User ID
+ * @returns {Promise<string>} Risk profile ('LOW', 'MODERATE', 'HIGH')
+ */
+async function getUserRiskProfile(userId) {
+  // Check UserPreference for risk profile (if we add it in future)
+  // For now, we'll check for any active subscriber's risk profile or use default
+  if (mongooseConnected) {
+    try {
+      // UserPreference and Subscriber are already imported at the top
+      const preference = await UserPreference.findOne({ user_id: userId }).lean();
+      if (preference && preference.risk_profile) {
+        return normalizeRiskProfileForAPI(preference.risk_profile);
+      }
+      
+      // Try to get from first active subscriber (fallback)
+      const subscriber = await Subscriber.findOne({ user_id: userId, is_active: true }).lean();
+      if (subscriber && subscriber.risk_profile) {
+        return normalizeRiskProfileForAPI(subscriber.risk_profile);
+      }
+    } catch (e) {
+      console.warn('[MarketIntelligence] Error fetching user risk profile:', e.message);
+    }
+  }
+  
+  // Default to MODERATE
+  return 'MODERATE';
+}
+
+/**
+ * POST /api/market-intelligence
+ * Fetch market intelligence for a given ticker
+ * Requires authentication
+ */
+app.post("/api/market-intelligence", loginRequired, async (req, res) => {
+  try {
+    const { ticker } = req.body;
+
+    if (!ticker || typeof ticker !== 'string' || ticker.trim() === '') {
+      return res.status(400).json({
+        status: "error",
+        message: "Ticker is required"
+      });
+    }
+
+    const normalizedTicker = ticker.trim().toUpperCase();
+    const userId = req.user._id || req.user.id;
+
+    // Get user's risk profile (default to MODERATE)
+    const riskProfile = await getUserRiskProfile(userId);
+    console.log(`[MarketIntelligence] Request for ${normalizedTicker} with risk profile: ${riskProfile}`);
+
+    // Get current date for analysis_date (YYYY-MM-DD)
+    const analysisDate = new Date().toISOString().split('T')[0];
+
+    // Check cache first
+    const cachedResult = marketIntelligenceCache.get(normalizedTicker, analysisDate, riskProfile);
+    if (cachedResult) {
+      console.log(`[MarketIntelligence] Cache hit for ${normalizedTicker} on ${analysisDate}`);
+      return res.json({
+        status: "success",
+        data: cachedResult,
+        cached: true
+      });
+    }
+
+    // Fetch from agentic AI service
+    console.log(`[MarketIntelligence] Fetching from agentic AI service for ${normalizedTicker}...`);
+    const rawResponse = await fetchMarketIntelligence({
+      ticker: normalizedTicker,
+      riskProfile: riskProfile
+    });
+
+    // Normalize the response
+    const normalizedData = normalizeMarketIntelligence(rawResponse);
+
+    // Update analysis date from response if available
+    const actualAnalysisDate = normalizedData.analysisDate || analysisDate;
+
+    // Cache the normalized result
+    marketIntelligenceCache.set(normalizedTicker, actualAnalysisDate, riskProfile, normalizedData);
+
+    console.log(`[MarketIntelligence] Successfully fetched and cached intelligence for ${normalizedTicker}`);
+
+    // Return normalized response
+    return res.json({
+      status: "success",
+      data: normalizedData,
+      cached: false
+    });
+
+  } catch (error) {
+    console.error("[MarketIntelligence] Error:", error);
+    return res.status(500).json({
+      status: "error",
+      message: error.message || "Failed to fetch market intelligence"
     });
   }
 });

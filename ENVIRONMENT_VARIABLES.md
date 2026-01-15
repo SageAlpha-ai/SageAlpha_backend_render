@@ -151,6 +151,13 @@ Set these only if you want persistent file storage (not ephemeral `/tmp`).
 - **Example**: `5`
 - **Required**: ❌ NO (defaults to 5 minutes)
 
+### 19. `AGENTIC_AI_BASE_URL`
+- **Description**: Base URL for the external agentic AI service (market chatter intelligence)
+- **Format**: Full URL without trailing slash
+- **Example**: `https://postgres-host-localhost.onrender.com`
+- **Required**: ❌ NO (defaults to `https://postgres-host-localhost.onrender.com`)
+- **Note**: Required only if using the market intelligence feature. Set this if the default URL changes or you want to use a different service.
+
 ---
 
 ## 🔵 AZURE AUTO-SET (Don't manually set these)
