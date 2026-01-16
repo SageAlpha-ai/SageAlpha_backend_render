@@ -26,10 +26,11 @@ const jwt = require("jsonwebtoken");
 const nunjucks = require("nunjucks");
 const mongoose = require('mongoose');
 const MongoStore = require('connect-mongo');
+const { MongoClient, ObjectId } = require('mongodb');
 const bcrypt = require("bcryptjs");
 const fs = require("fs");
 // path already required above
-const { OpenAI, AzureOpenAI } = require("openai");
+// Azure OpenAI removed - now using RAG service
 const { generateReportHtml } = require("./reportTemplate");
 const { convertHtmlToPdf } = require("./pdfGenerator");
 const { uploadHtmlToBlob, getHtmlFromBlob, deleteHtmlFromBlob, uploadPdfToBlob, getBlobUrl } = require("./utils/blobStorage");
@@ -168,12 +169,32 @@ if (MONGO_URL) {
   });
 }
 
+// Separate MongoDB connection for Agentic AI notifications database
+const AGENTIC_AI_MONGO_URI = "mongodb+srv://sagealphaai:Alpha123@alert-ai.akqhuxw.mongodb.net/";
+let notificationsDb = null;
+let notificationsDbConnected = false;
+
+// Create separate connection for notifications database
+const notificationsClient = new MongoClient(AGENTIC_AI_MONGO_URI);
+
+notificationsClient.connect().then(() => {
+  notificationsDbConnected = true;
+  notificationsDb = notificationsClient.db('sagealpha');
+  console.log('[DB] Connected to Agentic AI notifications database');
+}).catch((e) => {
+  console.error('[DB] Agentic AI notifications DB connect failed:', e && e.message);
+  if (!IS_PRODUCTION) {
+    console.warn('[DB] Continuing without notifications DB (dev mode)');
+  }
+});
+
 // Environment Validation Logging
 console.log(`[ENV] IS_PRODUCTION: ${IS_PRODUCTION}`);
 console.log(`[ENV] PORT: ${PORT}`);
 if (IS_PRODUCTION) {
   if (!process.env.MONGO_URL) console.warn('[ENV] MONGO_URL missing!');
-  if (!process.env.AZURE_OPENAI_API_KEY) console.warn('[ENV] AZURE_OPENAI_API_KEY missing!');
+  if (!process.env.RAG_API_KEY) console.warn('[ENV] RAG_API_KEY missing!');
+  if (!process.env.RAG_API_URL) console.warn('[ENV] RAG_API_URL missing!');
 }
 
 // ==========================================
@@ -726,78 +747,169 @@ class VectorStore {
 
 const vs = new VectorStore(VECTOR_STORE_DIR);
 
-// --- LLM Client Setup ---
-let llmClient = null;
-let llmMode = "none"; // azure, openai, mock
+// --- RAG Service Configuration ---
+const RAG_API_URL = process.env.RAG_API_URL || "https://sagealpha-rag-llm.onrender.com";
+const RAG_API_KEY = process.env.RAG_API_KEY;
 
-function initLLM() {
-  // 1. Azure OpenAI
-  if (process.env.AZURE_OPENAI_API_KEY && process.env.AZURE_OPENAI_ENDPOINT) {
-    llmClient = new AzureOpenAI({
-      apiKey: process.env.AZURE_OPENAI_API_KEY,
-      endpoint: process.env.AZURE_OPENAI_ENDPOINT,
-      apiVersion: process.env.AZURE_OPENAI_API_VERSION || "2024-02-15-preview",
-      deployment: process.env.AZURE_OPENAI_DEPLOYMENT
-    });
-    llmMode = "azure";
-    console.log("[LLM] Azure OpenAI initialized.");
-  }
-  // 2. Standard OpenAI
-  else if (process.env.OPENAI_API_KEY) {
-    llmClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    llmMode = "openai";
-    console.log("[LLM] OpenAI initialized.");
-  }
-  // 3. Mock
-  else {
-    llmMode = "mock";
-    console.log("[LLM] Formatting Mock mode enabled.");
+let ragMode = "none"; // rag, mock
+
+function initRAG() {
+  if (RAG_API_URL && RAG_API_KEY) {
+    ragMode = "rag";
+    console.log("[RAG] RAG service initialized.");
+    console.log(`[RAG] API URL: ${RAG_API_URL}`);
+  } else {
+    ragMode = "mock";
+    console.log("[RAG] Mock mode enabled (RAG_API_URL or RAG_API_KEY not set).");
   }
 }
-initLLM();
+initRAG();
 
 async function getEmbedding(text) {
-  if (llmMode === "mock" || !llmClient) {
-    // Deterministic dummy embedding (pseudo-random based on hash)
-    // Note: Real world this is garbage, but fine for mock structure test
-    return new Array(1536).fill(0).map(() => Math.random() * 0.1);
-  }
-  try {
-    const model = process.env.AZURE_OPENAI_EMBEDDING_DEPLOYMENT || "text-embedding-3-small";
-    // Safety check: Avoid non-embedding models like 'gpt-5-chat'
-    const finalModel = (model.includes('gpt') || model.includes('chat')) ? "text-embedding-3-small" : model;
+  // Embeddings are now handled by the RAG service, so we return a dummy for local vector store compatibility
+  // The RAG service handles its own embeddings internally
+  return new Array(1536).fill(0).map(() => Math.random() * 0.1);
+}
 
-    const resp = await llmClient.embeddings.create({
-      model: finalModel,
-      input: text
-    });
-    return resp.data[0].embedding;
-  } catch (e) {
-    console.error("[Embedding] Error:", e.message);
-    return new Array(1536).fill(0);
+/**
+ * Call RAG service for chat completion
+ * @param {string} query - User query/message
+ * @param {string} sessionId - Optional session ID for conversation context
+ * @returns {Promise<string>} Response from RAG service
+ */
+async function ragChatCompletion(query, sessionId = null) {
+  if (ragMode === "mock" || !RAG_API_KEY) {
+    return `[MOCK RESPONSE] You asked: "${query}". SageAlpha Node backend is running! RAG service not configured.`;
+  }
+
+  try {
+    const response = await axios.post(
+      `${RAG_API_URL}/query`,
+      {
+        query: query,
+        session_id: sessionId || undefined
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${RAG_API_KEY}`,
+          "X-API-Key": RAG_API_KEY
+        },
+        timeout: 60000 // 60 seconds timeout
+      }
+    );
+
+    // Handle different response formats
+    if (response.data && typeof response.data === 'string') {
+      return response.data;
+    } else if (response.data && response.data.response) {
+      return response.data.response;
+    } else if (response.data && response.data.answer) {
+      return response.data.answer;
+    } else if (response.data && response.data.message) {
+      return response.data.message;
+    } else {
+      console.warn("[RAG] Unexpected response format:", response.data);
+      return JSON.stringify(response.data);
+    }
+  } catch (error) {
+    console.error("[RAG] Chat completion error:", error.message);
+    if (error.response) {
+      console.error("[RAG] Response status:", error.response.status);
+      console.error("[RAG] Response data:", error.response.data);
+      throw new Error(`RAG service error: ${error.response.status} - ${error.response.data?.message || error.message}`);
+    } else if (error.request) {
+      throw new Error("No response from RAG service. Please try again later.");
+    } else {
+      throw new Error(`Failed to call RAG service: ${error.message}`);
+    }
   }
 }
 
-async function chatCompletion(messages) {
-  if (llmMode === "mock" || !llmClient) {
-    const lastMsg = messages[messages.length - 1].content;
-    return `[MOCK RESPONSE] You asked: "${lastMsg}". SageAlpha Node backend is running! Real LLM not configured.`;
+/**
+ * Call RAG service for report generation
+ * @param {string} prompt - Report generation prompt
+ * @param {string} sessionId - Optional session ID
+ * @returns {Promise<string>} JSON response from RAG service
+ */
+async function ragReportGeneration(prompt, sessionId = null) {
+  if (ragMode === "mock" || !RAG_API_KEY) {
+    return JSON.stringify({
+      companyName: "Mock Company",
+      ticker: "MOCK",
+      subtitle: "Mock Report",
+      sector: "Technology",
+      region: "Global",
+      rating: "NEUTRAL",
+      targetPrice: "100",
+      targetPeriod: "12-18M",
+      currentPrice: "100",
+      upside: "+0%",
+      marketCap: "INR1000",
+      entValue: "INR1000",
+      evEbitda: "10.0",
+      pe: "10.0",
+      investmentThesis: [{ title: "Mock", content: "Mock data" }],
+      highlights: [{ title: "Mock", content: "Mock data" }],
+      valuationMethodology: [{ method: "DCF", details: "Mock" }],
+      catalysts: [{ title: "Mock", impact: "Mock" }],
+      risks: [{ title: "Mock", impact: "Mock" }],
+      financialSummary: [
+        { year: "2024A", rev: "0", ebitda: "0", mrg: "0%", eps: "0", fcf: "0" },
+        { year: "2025E", rev: "0", ebitda: "0", mrg: "0%", eps: "0", fcf: "0" },
+        { year: "2026E", rev: "0", ebitda: "0", mrg: "0%", eps: "0", fcf: "0" }
+      ],
+      analyst: "SageAlpha Research Team",
+      analystEmail: "research@sagealpha.ai",
+      ratingHistory: [{ event: "Init", date: "Month Year @ $Price" }]
+    });
   }
 
-  const model = llmMode === "azure"
-    ? (process.env.AZURE_OPENAI_DEPLOYMENT || "SageAlpha.ai")
-    : (process.env.OPENAI_MODEL || "gpt-4.0");
+  try {
+    const response = await axios.post(
+      `${RAG_API_URL}/query`,
+      {
+        query: prompt,
+        session_id: sessionId || undefined
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${RAG_API_KEY}`,
+          "X-API-Key": RAG_API_KEY
+        },
+        timeout: 120000 // 120 seconds timeout for report generation
+      }
+    );
 
-  const resp = await llmClient.chat.completions.create({
-    model: model,
-    messages: messages,
-    temperature: 0.5,
-    max_tokens: 1500,
-    top_p: 1,
-    frequency_penalty: 0,
-    presence_penalty: 0
-  });
-  return resp.choices[0].message.content;
+    // Handle different response formats
+    let responseText = "";
+    if (response.data && typeof response.data === 'string') {
+      responseText = response.data;
+    } else if (response.data && response.data.response) {
+      responseText = response.data.response;
+    } else if (response.data && response.data.answer) {
+      responseText = response.data.answer;
+    } else if (response.data && response.data.message) {
+      responseText = response.data.message;
+    } else {
+      console.warn("[RAG] Unexpected response format:", response.data);
+      responseText = JSON.stringify(response.data);
+    }
+
+    return responseText;
+  } catch (error) {
+    console.error("[RAG] Report generation error:", error.message);
+    if (error.response) {
+      console.error("[RAG] Response status:", error.response.status);
+      console.error("[RAG] Response data:", error.response.data);
+      throw new Error(`RAG service error: ${error.response.status} - ${error.response.data?.message || error.message}`);
+    } else if (error.request) {
+      throw new Error("No response from RAG service. Please try again later.");
+    } else {
+      throw new Error(`Failed to call RAG service: ${error.message}`);
+    }
+  }
 }
 
 // REPORTS_DIR already defined above in Azure-safe paths section
@@ -855,12 +967,10 @@ The output must be ONLY a valid JSON object matching this structure:
 }
 Do not include any other text or markdown formatting.`;
 
-  const messages = [
-    { role: "system", content: systemPrompt },
-    { role: "user", content: userMessage }
-  ];
+  // Combine system prompt and user message for RAG service
+  const fullPrompt = `${systemPrompt}\n\nUser Request: ${userMessage}`;
 
-  let response = await chatCompletion(messages);
+  let response = await ragReportGeneration(fullPrompt);
 
   // Clean up JSON if LLM added markdown blocks
   response = response.replace(/```json/g, "").replace(/```/g, "").trim();
@@ -941,38 +1051,57 @@ app.post("/chat", async (req, res) => {
       }
     }
 
-    // 4. RAG Retrieval
-    const qEmb = await getEmbedding(message);
-    const docs = vs.search(qEmb, parseInt(top_k) || 5);
+    // 4. RAG Service Call
+    // The RAG service handles embeddings and context retrieval internally
+    // We just pass the user message and session ID
+    let aiResponse;
+    let sources = [];
+    
+    try {
+      // Call RAG service directly to get full response (including sources if available)
+      const response = await axios.post(
+        `${RAG_API_URL}/query`,
+        {
+          query: message,
+          session_id: chatId || undefined
+        },
+        {
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${RAG_API_KEY}`,
+            "X-API-Key": RAG_API_KEY
+          },
+          timeout: 60000
+        }
+      );
 
-    // Build Context
-    let contextText = "";
-    const sources = [];
-    if (docs.length > 0 && docs[0].score > 0.35) {
-      contextText = docs.map(d => `Source: ${d.meta.source}\n${d.text}`).join("\n\n").substring(0, 6000);
-      sources.push(...docs.map(d => ({ doc_id: d.doc_id, source: d.meta.source, score: d.score })));
+      // Extract response text
+      if (response.data && typeof response.data === 'string') {
+        aiResponse = response.data;
+      } else if (response.data && response.data.response) {
+        aiResponse = response.data.response;
+      } else if (response.data && response.data.answer) {
+        aiResponse = response.data.answer;
+      } else if (response.data && response.data.message) {
+        aiResponse = response.data.message;
+      } else {
+        aiResponse = JSON.stringify(response.data);
+      }
+
+      // Extract sources if available
+      if (response.data && response.data.sources) {
+        sources = response.data.sources;
+      } else if (response.data && response.data.sources_list) {
+        sources = response.data.sources_list;
+      }
+    } catch (error) {
+      console.error("[RAG] Chat completion error:", error.message);
+      if (ragMode === "mock" || !RAG_API_KEY) {
+        aiResponse = `[MOCK RESPONSE] You asked: "${message}". SageAlpha Node backend is running! RAG service not configured.`;
+      } else {
+        throw error;
+      }
     }
-
-    // 5. Build Messages
-    const systemPrompt = `You are SageAlpha, a financial assistant.
-Use this context if relevant:
-${contextText}
-
-If context is empty or irrelevant, answer from knowledge. Be precise.`;
-
-    // Get recent history
-    let historyRows = [];
-    if (mongooseConnected) {
-      historyRows = (await Message.find({ session_id: chatId }).sort({ _id: -1 }).limit(10).lean()).reverse();
-    }
-
-    const messages = [
-      { role: "system", content: systemPrompt },
-      ...historyRows.map(r => ({ role: r.role, content: r.content }))
-    ];
-
-    // 6. LLM Call
-    const aiResponse = await chatCompletion(messages);
 
     // 7. Save Assistant Message
     if (mongooseConnected) {
@@ -1005,7 +1134,7 @@ app.get("/", loginRequired, (req, res) => {
   // We need to pass data for the chat interface (available sessions, etc)
   res.render("index.html", {
     APP_VERSION: res.locals.APP_VERSION,
-    LLM_MODE: llmMode
+    LLM_MODE: ragMode
   });
 });
 
@@ -1045,6 +1174,120 @@ app.get("/portfolio", loginRequired, async (req, res) => {
   }
 
   res.status(500).json({ error: "Database not connected" });
+});
+
+// ==========================================
+// NOTIFICATIONS API ROUTES
+// ==========================================
+
+/**
+ * GET /api/notifications
+ * Fetch notifications for the logged-in user from Agentic AI database
+ * Returns notifications sorted by created_at descending with unread count
+ */
+app.get("/api/notifications", loginRequired, async (req, res) => {
+  try {
+    if (!notificationsDbConnected || !notificationsDb) {
+      return res.status(503).json({ 
+        error: "Notifications service unavailable",
+        notifications: [],
+        unread_count: 0
+      });
+    }
+
+    const userId = req.user._id ? req.user._id.toString() : req.user.id;
+
+    // Fetch all notifications (ignoring user_id field as per requirements)
+    // Sort by created_at descending (newest first)
+    const notifications = await notificationsDb
+      .collection('notifications')
+      .find({})
+      .sort({ created_at: -1 })
+      .toArray();
+
+    // Calculate unread count
+    const unreadCount = notifications.filter(n => !n.is_read).length;
+
+    // Format notifications for response
+    const formattedNotifications = notifications.map(notif => ({
+      _id: notif._id.toString(),
+      event_id: notif.event_id || null,
+      company_code: notif.company_code || null,
+      symbol: notif.symbol || null,
+      title: notif.title || 'Notification',
+      message: notif.message || '',
+      is_read: notif.is_read || false,
+      created_at: notif.created_at || new Date()
+    }));
+
+    return res.json({
+      notifications: formattedNotifications,
+      unread_count: unreadCount
+    });
+
+  } catch (error) {
+    console.error("[Notifications] Fetch error:", error);
+    return res.status(500).json({ 
+      error: "Failed to fetch notifications",
+      notifications: [],
+      unread_count: 0
+    });
+  }
+});
+
+/**
+ * PATCH /api/notifications/:id/read
+ * Mark a notification as read
+ * Validates notification exists before updating
+ */
+app.patch("/api/notifications/:id/read", loginRequired, async (req, res) => {
+  try {
+    if (!notificationsDbConnected || !notificationsDb) {
+      return res.status(503).json({ 
+        error: "Notifications service unavailable"
+      });
+    }
+
+    const notificationId = req.params.id;
+    const userId = req.user._id ? req.user._id.toString() : req.user.id;
+
+    // Validate ObjectId format
+    if (!ObjectId.isValid(notificationId)) {
+      return res.status(400).json({ error: "Invalid notification ID" });
+    }
+
+    // Find notification to ensure it exists
+    const notification = await notificationsDb
+      .collection('notifications')
+      .findOne({ _id: new ObjectId(notificationId) });
+
+    if (!notification) {
+      return res.status(404).json({ error: "Notification not found" });
+    }
+
+    // Update notification to mark as read
+    const result = await notificationsDb
+      .collection('notifications')
+      .updateOne(
+        { _id: new ObjectId(notificationId) },
+        { $set: { is_read: true } }
+      );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ error: "Notification not found" });
+    }
+
+    return res.json({ 
+      success: true, 
+      message: "Notification marked as read" 
+    });
+
+  } catch (error) {
+    console.error("[Notifications] Mark read error:", error);
+    return res.status(500).json({ 
+      error: "Failed to mark notification as read"
+    });
+  }
 });
 
 // Additional page routes so frontend navigation to pages like /profile works
@@ -1480,10 +1723,9 @@ app.post("/chat/create-report", loginRequired, async (req, res) => {
   try {
     console.log(`[Report] Generating for: ${company_name}`);
 
-    // Context retrieval
-    const qEmb = await getEmbedding(company_name);
-    const docs = vs.search(qEmb, 3);
-    const contextText = docs.map(d => d.text).join("\n\n").substring(0, 5000);
+    // Context retrieval is now handled by the RAG service
+    // We pass the company name and let the RAG service retrieve relevant context from ChromaDB
+    const contextText = ""; // RAG service handles context internally
 
     const reportHtml = await generateEquityResearchHTML(
       company_name,
@@ -1506,8 +1748,39 @@ app.post("/chat/create-report", loginRequired, async (req, res) => {
     // Save report to database for portfolio
     let savedReport = null;
     if (mongooseConnected) {
-      // Save report to Report model
+      // Create or update PortfolioItem for this company
+      const today = new Date().toISOString().split('T')[0];
+      const now = new Date();
+      
+      let portfolioItem = await PortfolioItem.findOne({ 
+        user_id: userId, 
+        company_name: company_name,
+        item_date: { $gte: new Date(today) }
+      });
+
+      let portfolioItemId;
+      if (portfolioItem) {
+        // Update existing portfolio item
+        portfolioItemId = portfolioItem._id;
+        await PortfolioItem.updateOne(
+          { _id: portfolioItemId },
+          { $set: { updated_at: now } }
+        );
+      } else {
+        // Create new portfolio item
+        const createdPortfolioItem = await PortfolioItem.create({
+          user_id: userId,
+          company_name: company_name,
+          ticker: "", // Can be extracted later if needed
+          source_type: 'chat',
+          item_date: new Date(today)
+        });
+        portfolioItemId = createdPortfolioItem._id;
+      }
+
+      // Save report to Report model and link to PortfolioItem
       savedReport = await Report.create({
+        portfolio_item_id: portfolioItemId,
         user_id: userId,
         title: `Equity Research Note – ${company_name}`,
         status: 'pending',
@@ -1517,7 +1790,6 @@ app.post("/chat/create-report", loginRequired, async (req, res) => {
         report_date: new Date(),
         created_at: new Date()
       });
-
 
       // Save chat history
       if (!session_id) {
@@ -2598,8 +2870,16 @@ process.on('SIGTERM', () => {
   console.log('[PROCESS] SIGTERM received, shutting down gracefully...');
   server.close(() => {
     console.log('[PROCESS] Server closed');
-    mongoose.connection.close().then(() => {
-      console.log('[PROCESS] MongoDB connection closed');
+    Promise.all([
+      mongoose.connection.close().then(() => {
+        console.log('[PROCESS] Main MongoDB connection closed');
+      }),
+      notificationsClient.close().then(() => {
+        console.log('[PROCESS] Notifications MongoDB connection closed');
+      }).catch(() => {
+        console.warn('[PROCESS] Notifications MongoDB close failed (may not be connected)');
+      })
+    ]).then(() => {
       process.exit(0);
     }).catch(() => process.exit(1));
   });
