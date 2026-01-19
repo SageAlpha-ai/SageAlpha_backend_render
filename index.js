@@ -38,6 +38,7 @@ const { sendWhatsAppReport } = require("./services/whatsapp.service");
 const { fetchMarketIntelligence } = require("./services/agenticIntelligenceService");
 const { normalizeMarketIntelligence } = require("./utils/normalizeMarketIntelligence");
 const marketIntelligenceCache = require("./utils/marketIntelligenceCache");
+const { resolveNseSymbol } = require("./utils/symbolResolver");
 
 
 // Mongoose models (wilFl be required after connecting)
@@ -207,7 +208,7 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
   : IS_PRODUCTION
     ? [] // Production MUST set ALLOWED_ORIGINS
-    : ["http://localhost:5173", "http://localhost:3000","http://localhost:5174"]; // Dev fallback
+    : ["http://localhost:5173", "http://localhost:3000","http://localhost:5174","http://localhost:5175","http://localhost:5175"]; // Dev fallback
 
 if (IS_PRODUCTION && allowedOrigins.length === 0) {
   console.warn('[CORS] WARNING: ALLOWED_ORIGINS not set in production! CORS may fail.');
@@ -1123,6 +1124,88 @@ app.post("/chat", async (req, res) => {
 });
 
 // ==========================================
+// 6.1 COMPLIANCE CHAT ROUTE
+// ==========================================
+
+app.post("/compliance/chat", loginRequired, async (req, res) => {
+  try {
+    const { query } = req.body;
+    
+    if (!query || typeof query !== 'string' || query.trim().length === 0) {
+      return res.status(400).json({ error: "Query is required and must be a non-empty string" });
+    }
+
+    const complianceApiUrl = "https://sagealpha-rag-compliance.onrender.com/query";
+    
+    console.log(`[Compliance Chat] Forwarding query to compliance API: ${complianceApiUrl}`);
+    
+    // Forward query to external compliance API
+    const response = await axios.post(
+      complianceApiUrl,
+      { query: query.trim() },
+      {
+        headers: {
+          "Content-Type": "application/json",
+        },
+        timeout: 30000, // 30 second timeout
+      }
+    );
+
+    // Extract response - handle different possible field names
+    let reply = null;
+    if (response.data) {
+      reply = response.data.answer || response.data.response || response.data.reply || response.data.text;
+      
+      // If still no reply, try to get the entire response as string
+      if (!reply && typeof response.data === 'string') {
+        reply = response.data;
+      }
+      
+      // Last resort: stringify the entire response
+      if (!reply) {
+        console.warn("[Compliance Chat] Unexpected response format:", response.data);
+        reply = JSON.stringify(response.data);
+      }
+    }
+
+    if (!reply) {
+      throw new Error("No response received from compliance API");
+    }
+
+    console.log(`[Compliance Chat] Successfully received response from compliance API`);
+    
+    return res.json({ reply: reply });
+
+  } catch (error) {
+    console.error("[Compliance Chat] Error:", error.message);
+    
+    // Handle axios errors specifically
+    if (error.response) {
+      // The request was made and the server responded with a status code outside 2xx
+      console.error("[Compliance Chat] API responded with error:", error.response.status, error.response.data);
+      return res.status(502).json({ 
+        error: "Compliance service returned an error",
+        reply: "Sorry, the compliance service is currently unavailable. Please try again later."
+      });
+    } else if (error.request) {
+      // The request was made but no response was received
+      console.error("[Compliance Chat] No response from compliance API");
+      return res.status(503).json({ 
+        error: "Compliance service is unreachable",
+        reply: "Sorry, I couldn't reach the compliance service. Please check your connection and try again."
+      });
+    } else {
+      // Something happened in setting up the request
+      console.error("[Compliance Chat] Request setup error:", error.message);
+      return res.status(500).json({ 
+        error: "Internal server error",
+        reply: "Sorry, an unexpected error occurred. Please try again later."
+      });
+    }
+  }
+});
+
+// ==========================================
 // 7. PORTFOLIO ROUTES
 // ==========================================
 
@@ -1317,53 +1400,174 @@ app.get('/forgot-password', (req, res) => res.redirect('/forgot_password'));
 app.get('/auth/login', (req, res) => res.redirect('/login'));
 
 app.post("/portfolio/add", loginRequired, async (req, res) => {
-  // { company_name, ticker }
-  const { company_name, ticker } = req.body;
+  // Accepts either company_name or symbol from the client.
+  // We ALWAYS resolve to a canonical NSE symbol before writing.
+  const { company_name: rawCompanyName, ticker, symbol: rawSymbol } = req.body;
   const userId = req.user._id ? req.user._id : req.user.id;
 
-  if (!company_name) return res.status(400).json({ error: "Company Name Required" });
+  const userInput = rawSymbol || ticker || rawCompanyName;
+  if (!userInput) {
+    return res
+      .status(400)
+      .json({ error: "company_name or symbol is required" });
+  }
 
-  const today = new Date().toISOString().split('T')[0];
+  // Resolve NSE symbol + official company name.
+  // This makes `symbol` the single source of truth for downstream agents.
+  const resolved = resolveNseSymbol(userInput);
+  if (!resolved) {
+    return res.status(400).json({
+      error:
+        "Unable to resolve NSE symbol for the provided company/symbol. Please use a valid NSE-listed stock.",
+    });
+  }
+
+  const { symbol, company_name } = resolved;
+
+  const today = new Date().toISOString().split("T")[0];
   const now = new Date();
 
   if (mongooseConnected) {
-    let item = await PortfolioItem.findOne({ user_id: userId, company_name: company_name, item_date: { $gte: new Date(today) } });
+    // Use (user_id, symbol, item_date) as logical uniqueness for the day.
+    let item = await PortfolioItem.findOne({
+      user_id: userId,
+      symbol,
+      item_date: { $gte: new Date(today) },
+    });
     let itemId;
     if (item) {
       itemId = item._id;
-      await PortfolioItem.updateOne({ _id: itemId }, { $set: { updated_at: new Date() } });
+      await PortfolioItem.updateOne(
+        { _id: itemId },
+        {
+          $set: {
+            company_name,
+            updated_at: now,
+          },
+        }
+      );
     } else {
-      const created = await PortfolioItem.create({ user_id: userId, company_name, ticker: ticker || "", item_date: new Date(today) });
+      const created = await PortfolioItem.create({
+        user_id: userId,
+        company_name,
+        symbol,
+        source_type: "chat",
+        item_date: new Date(today),
+      });
       itemId = created._id;
 
-      await Report.create({ portfolio_item_id: itemId, user_id: userId, title: `Equity Research Note – ${company_name}`, status: 'pending', report_date: new Date(today), created_at: now });
+      await Report.create({
+        portfolio_item_id: itemId,
+        user_id: userId,
+        title: `Equity Research Note – ${company_name}`,
+        status: "pending",
+        report_date: new Date(today),
+        created_at: now,
+      });
     }
 
     return res.json({ success: true, item_id: itemId });
   }
 
-  // Fallback SQLite behavior
-  const exist = db.prepare("SELECT id FROM portfolio_items WHERE user_id=? AND company_name=? AND item_date=?").get(userId, company_name, today);
+  // Fallback SQLite behavior (legacy) - keep ticker column for backward compatibility.
+  const exist = db
+    .prepare(
+      "SELECT id FROM portfolio_items WHERE user_id=? AND company_name=? AND item_date=?"
+    )
+    .get(userId, company_name, today);
 
   let itemId;
   if (exist) {
     itemId = exist.id;
-    db.prepare("UPDATE portfolio_items SET updated_at=? WHERE id=?").run(now, itemId);
+    db.prepare("UPDATE portfolio_items SET updated_at=? WHERE id=?").run(
+      now,
+      itemId
+    );
   } else {
-    const info = db.prepare(`
+    const info = db
+      .prepare(
+        `
             INSERT INTO portfolio_items (user_id, company_name, ticker, item_date, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?)
-        `).run(userId, company_name, ticker || "", today, now, now);
+        `
+      )
+      .run(userId, company_name, symbol, today, now, now);
     itemId = info.lastInsertRowid;
 
     // Auto report
-    db.prepare(`
+    db.prepare(
+      `
             INSERT INTO reports (portfolio_item_id, user_id, title, status, report_date, created_at)
             VALUES (?, ?, ?, 'pending', ?, ?)
-        `).run(itemId, userId, `Equity Research Note – ${company_name}`, today, now);
+        `
+    ).run(
+      itemId,
+      userId,
+      `Equity Research Note – ${company_name}`,
+      today,
+      now
+    );
   }
 
   res.json({ success: true, item_id: itemId });
+});
+
+// Update portfolio item for a given id.
+// This route also enforces symbol normalization for consistency.
+app.put("/portfolio/:id", loginRequired, async (req, res) => {
+  const { id } = req.params;
+  const { company_name: rawCompanyName, ticker, symbol: rawSymbol } = req.body;
+  const userId = req.user._id ? req.user._id : req.user.id;
+
+  const userInput = rawSymbol || ticker || rawCompanyName;
+  if (!userInput) {
+    return res
+      .status(400)
+      .json({ error: "company_name or symbol is required" });
+  }
+
+  const resolved = resolveNseSymbol(userInput);
+  if (!resolved) {
+    return res.status(400).json({
+      error:
+        "Unable to resolve NSE symbol for the provided company/symbol. Please use a valid NSE-listed stock.",
+    });
+  }
+
+  const { symbol, company_name } = resolved;
+  const now = new Date();
+
+  if (mongooseConnected) {
+    const filter = { _id: id, user_id: userId };
+    const update = {
+      company_name,
+      symbol,
+      updated_at: now,
+    };
+
+    const result = await PortfolioItem.findOneAndUpdate(filter, update, {
+      new: true,
+    });
+
+    if (!result) {
+      return res.status(404).json({ error: "Portfolio item not found" });
+    }
+
+    return res.json({ success: true, item: result });
+  }
+
+  // SQLite fallback update
+  const info = db
+    .prepare(
+      "UPDATE portfolio_items SET company_name = ?, ticker = ?, updated_at = ? WHERE id = ? AND user_id = ?"
+    )
+    .run(company_name, symbol, now, id, userId);
+
+  if (info.changes === 0) {
+    return res.status(404).json({ error: "Portfolio item not found" });
+  }
+
+  return res.json({ success: true });
 });
 
 app.get("/subscribers", loginRequired, async (req, res) => {
@@ -1748,34 +1952,44 @@ app.post("/chat/create-report", loginRequired, async (req, res) => {
     // Save report to database for portfolio
     let savedReport = null;
     if (mongooseConnected) {
-      // Create or update PortfolioItem for this company
+      // Create or update PortfolioItem for this company.
+      // We try to resolve an NSE symbol here, but do NOT hard-fail the report
+      // generation if resolution fails – that would be too aggressive for users.
       const today = new Date().toISOString().split('T')[0];
       const now = new Date();
-      
-      let portfolioItem = await PortfolioItem.findOne({ 
-        user_id: userId, 
-        company_name: company_name,
-        item_date: { $gte: new Date(today) }
-      });
 
-      let portfolioItemId;
-      if (portfolioItem) {
-        // Update existing portfolio item
-        portfolioItemId = portfolioItem._id;
-        await PortfolioItem.updateOne(
-          { _id: portfolioItemId },
-          { $set: { updated_at: now } }
-        );
+      let portfolioItemId = null;
+      const resolved = resolveNseSymbol(company_name);
+
+      if (!resolved) {
+        console.warn("[Portfolio] Unable to resolve NSE symbol for company:", company_name);
       } else {
-        // Create new portfolio item
-        const createdPortfolioItem = await PortfolioItem.create({
-          user_id: userId,
-          company_name: company_name,
-          ticker: "", // Can be extracted later if needed
-          source_type: 'chat',
-          item_date: new Date(today)
+        const { symbol, company_name: resolvedCompanyName } = resolved;
+
+        let portfolioItem = await PortfolioItem.findOne({ 
+          user_id: userId, 
+          symbol,
+          item_date: { $gte: new Date(today) }
         });
-        portfolioItemId = createdPortfolioItem._id;
+
+        if (portfolioItem) {
+          // Update existing portfolio item
+          portfolioItemId = portfolioItem._id;
+          await PortfolioItem.updateOne(
+            { _id: portfolioItemId },
+            { $set: { company_name: resolvedCompanyName, updated_at: now } }
+          );
+        } else {
+          // Create new portfolio item with canonical symbol.
+          const createdPortfolioItem = await PortfolioItem.create({
+            user_id: userId,
+            company_name: resolvedCompanyName,
+            symbol,
+            source_type: 'chat',
+            item_date: new Date(today)
+          });
+          portfolioItemId = createdPortfolioItem._id;
+        }
       }
 
       // Save report to Report model and link to PortfolioItem
