@@ -151,7 +151,15 @@ Set these only if you want persistent file storage (not ephemeral `/tmp`).
 - **Example**: `5`
 - **Required**: ❌ NO (defaults to 5 minutes)
 
-### 19. `AGENTIC_AI_BASE_URL`
+### 19. `MARKET_CHATTER_AI_BASE_URL`
+- **Description**: Base URL for the external Market Chatter AI service
+- **Format**: `https://market-chatter-ai.onrender.com`
+- **Example**: `https://market-chatter-ai.onrender.com`
+- **Required**: ❌ NO (has default)
+- **Default**: `https://market-chatter-ai.onrender.com`
+- **Where to set**: Azure Portal → App Service → Configuration → Application Settings (optional)
+
+### 20. `AGENTIC_AI_BASE_URL`
 - **Description**: Base URL for the external agentic AI service (market chatter intelligence)
 - **Format**: Full URL without trailing slash
 - **Example**: `https://postgres-host-localhost.onrender.com`

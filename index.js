@@ -36,9 +36,20 @@ const { convertHtmlToPdf } = require("./pdfGenerator");
 const { uploadHtmlToBlob, getHtmlFromBlob, deleteHtmlFromBlob, uploadPdfToBlob, getBlobUrl } = require("./utils/blobStorage");
 const { sendWhatsAppReport } = require("./services/whatsapp.service");
 const { fetchMarketIntelligence } = require("./services/agenticIntelligenceService");
+const { fetchMarketChatter } = require("./services/marketChatter");
 const { normalizeMarketIntelligence } = require("./utils/normalizeMarketIntelligence");
 const marketIntelligenceCache = require("./utils/marketIntelligenceCache");
 const { resolveNseSymbol } = require("./utils/symbolResolver");
+const { 
+  saveReportDataFromLLM, 
+  getReportDataByReportId, 
+  getReportDataByCompanyName,
+  getPriceDataByReportId,
+  getPriceDataByCompanyName,
+  getLatestReportDataByCompanyForReportIds,
+  deleteReportDataByReportId,
+  deleteReportDataByReportIds
+} = require("./services/reportDataService");
 
 
 // Mongoose models (wilFl be required after connecting)
@@ -979,11 +990,16 @@ Do not include any other text or markdown formatting.`;
   try {
     const reportData = JSON.parse(response);
     console.log("report data in index.js", reportData);
-    return generateReportHtml(reportData, logoBase64);
+    const html = generateReportHtml(reportData, logoBase64);
+    // Return both HTML and reportData for price extraction
+    return { html, reportData };
   } catch (err) {
     console.error("[Report] JSON Parse Error. Falling back to simple HTML. Raw:", response);
     // Fallback to a very simple HTML if JSON fails
-    return `<html><body><h1>Error generating structured report</h1><pre>${response}</pre></body></html>`;
+    return { 
+      html: `<html><body><h1>Error generating structured report</h1><pre>${response}</pre></body></html>`,
+      reportData: null 
+    };
   }
 }
 
@@ -1257,6 +1273,146 @@ app.get("/portfolio", loginRequired, async (req, res) => {
   }
 
   res.status(500).json({ error: "Database not connected" });
+});
+
+/**
+ * GET /portfolio/items/:id/price-analysis
+ *
+ * Returns price analysis metadata for a portfolio item.
+ *
+ * NOTE:
+ * - Frontend expects: { lastApprovedDate, approvedCurrentPrice }
+ * - We compute lastApprovedDate from the latest approved Report for this portfolio_item_id.
+ * - approvedCurrentPrice is not currently persisted in DB; kept as null until market-price capture
+ *   is implemented at approval time (future enhancement). Do NOT break existing flows.
+ */
+app.get("/portfolio/items/:id/price-analysis", loginRequired, async (req, res) => {
+  try {
+    if (!mongooseConnected) {
+      return res.status(500).json({ error: "Database not connected" });
+    }
+
+    const userId = req.user._id;
+    const portfolioItemId = req.params.id;
+
+    // Ensure the portfolio item belongs to the user
+    const item = await PortfolioItem.findOne({ _id: portfolioItemId, user_id: userId }).lean();
+    if (!item) {
+      return res.status(404).json({ error: "Portfolio item not found" });
+    }
+
+    // For single-item price analysis, use persisted reportData values from the latest approved report(s).
+    const approvedReportIds = await Report.find({
+      user_id: userId,
+      portfolio_item_id: portfolioItemId,
+      status: "approved",
+    }).select("_id").lean();
+
+    const reportIds = approvedReportIds.map(r => r._id);
+
+    const normalizeCompanyKey = (name) =>
+      (name || "").toString().trim().toLowerCase();
+
+    const latestByCompanyRows = await getLatestReportDataByCompanyForReportIds(reportIds);
+    const key = normalizeCompanyKey(item.company_name || item.symbol || "");
+    const latest = latestByCompanyRows.find(r => normalizeCompanyKey(r.company_name) === key) || null;
+
+    const lastApprovedDate = latest?.created_at || null;
+    const approvedCurrentPrice = typeof latest?.current_price === "number" ? latest.current_price : null;
+    const approvedTargetPrice = typeof latest?.target_price === "number" ? latest.target_price : null;
+
+    return res.json({
+      lastApprovedDate,
+      approvedCurrentPrice,
+      approvedTargetPrice
+    });
+  } catch (e) {
+    console.error("[Price Analysis] Error:", e);
+    return res.status(500).json({ error: "Failed to fetch price analysis" });
+  }
+});
+
+/**
+ * GET /portfolio/price-analysis
+ *
+ * Returns price analysis metadata for ALL portfolio items belonging to the user.
+ * This is the universal endpoint for the Stock Price Analysis feature.
+ *
+ * Returns:
+ * {
+ *   items: [
+ *     {
+ *       companyName: string,
+ *       lastApprovedDate: Date | null,
+ *       approvedCurrentPrice: number | null,
+ *       approvedTargetPrice: number | null
+ *     },
+ *     ...
+ *   ]
+ * }
+ *
+ * NOTE:
+ * - We compute lastApprovedDate from the latest approved Report for each portfolio_item_id.
+ * - approvedCurrentPrice and approvedTargetPrice are not currently persisted in DB;
+ *   kept as null until market-price capture is implemented at approval time (future enhancement).
+ *   Do NOT break existing approval/portfolio workflows.
+ */
+app.get("/portfolio/price-analysis", loginRequired, async (req, res) => {
+  try {
+    if (!mongooseConnected) {
+      return res.status(500).json({ error: "Database not connected" });
+    }
+
+    const userId = req.user._id;
+
+    // Get all portfolio items for the user
+    const portfolioItems = await PortfolioItem.find({ user_id: userId }).sort({ updated_at: -1 }).lean();
+
+    // We only want to use *persisted* data from reportData for the "Last Approved" column.
+    // To keep scope tight and avoid re-parsing, we:
+    // 1) find user's approved reports
+    // 2) fetch latest reportData per company_name for those report_ids
+    const approvedReportIds = await Report.find({
+      user_id: userId,
+      status: "approved",
+    }).select("_id").lean();
+
+    const reportIds = approvedReportIds.map(r => r._id);
+
+    const normalizeCompanyKey = (name) =>
+      (name || "").toString().trim().toLowerCase();
+
+    const latestByCompanyRows = await getLatestReportDataByCompanyForReportIds(reportIds);
+    const latestByCompany = {};
+    for (const row of latestByCompanyRows) {
+      const key = normalizeCompanyKey(row.company_name);
+      if (key && !latestByCompany[key]) {
+        latestByCompany[key] = row;
+      }
+    }
+
+    // Build response array:
+    // Only include companies that exist in reportData (per requirement) to avoid placeholders.
+    const items = portfolioItems
+      .map((item) => {
+        const companyKey = normalizeCompanyKey(item.company_name || item.symbol || "");
+        const latest = latestByCompany[companyKey];
+        return {
+          companyName: item.company_name || item.symbol || "Unknown",
+          lastApprovedDate: latest?.created_at || null,
+          approvedCurrentPrice: typeof latest?.current_price === "number" ? latest.current_price : null,
+          approvedTargetPrice: typeof latest?.target_price === "number" ? latest.target_price : null,
+          _hasReportData: !!latest
+        };
+      })
+      .filter((x) => x._hasReportData)
+      .map(({ _hasReportData, ...rest }) => rest);
+
+    return res.json({ items });
+  } catch (e) {
+    console.error("[Price Analysis] Error:", e);
+    return res.status(500).json({ error: "Failed to fetch price analysis" });
+  }
 });
 
 // ==========================================
@@ -1874,6 +2030,7 @@ app.post("/reports/delete-all", loginRequired, async (req, res) => {
     try {
       // Get all reports for this user
       const reports = await Report.find({ user_id: userId }).lean();
+      const reportIds = reports.map(r => r._id);
 
       // Delete all blob storage files for these reports
       for (const report of reports) {
@@ -1885,6 +2042,13 @@ app.post("/reports/delete-all", loginRequired, async (req, res) => {
             // Continue with DB deletion even if blob deletion fails
           }
         }
+      }
+
+      // Delete associated reportData (best-effort)
+      try {
+        await deleteReportDataByReportIds(reportIds);
+      } catch (e) {
+        console.warn("[ReportData] Failed to delete reportData in bulk:", e?.message || e);
       }
 
       // Delete all reports from database
@@ -1931,14 +2095,40 @@ app.post("/chat/create-report", loginRequired, async (req, res) => {
     // We pass the company name and let the RAG service retrieve relevant context from ChromaDB
     const contextText = ""; // RAG service handles context internally
 
-    const reportHtml = await generateEquityResearchHTML(
+    const reportResult = await generateEquityResearchHTML(
       company_name,
       `Generate research report for ${company_name}`,
       contextText
     );
+    const reportHtml = reportResult.html || reportResult; // Handle both old and new return format
+    const reportData = reportResult.reportData || null;
 
     const safeCompanyName = company_name.replace(/ /g, "_").replace(/[^\w]/g, "").toLowerCase();
     const reportId = `${safeCompanyName}_${Date.now()}`;
+
+    // Extract price data from reportData if available
+    let currentPrice = null;
+    let targetPrice = null;
+    if (reportData) {
+      // Extract numeric value from price strings like "INR 1,050", "INR875", "1,050", etc.
+      const extractPrice = (priceStr) => {
+        if (!priceStr) return null;
+        // Handle both string and number types
+        if (typeof priceStr === 'number') return priceStr;
+        if (typeof priceStr !== 'string') return null;
+        
+        // Remove currency symbols (INR, $, ₹), commas, spaces, and any non-numeric characters except decimal point
+        const numericStr = priceStr.replace(/[INR$₹,\s]/gi, '').replace(/[^\d.]/g, '').trim();
+        if (!numericStr) return null;
+        
+        const num = parseFloat(numericStr);
+        return isNaN(num) ? null : num;
+      };
+      currentPrice = extractPrice(reportData.currentPrice);
+      targetPrice = extractPrice(reportData.targetPrice);
+      
+      console.log(`[Report] Extracted prices - Current: ${currentPrice}, Target: ${targetPrice}`);
+    }
 
     // Upload HTML to Azure Blob Storage
     const blobFileName = await uploadHtmlToBlob(reportId, reportHtml);
@@ -1953,43 +2143,50 @@ app.post("/chat/create-report", loginRequired, async (req, res) => {
     let savedReport = null;
     if (mongooseConnected) {
       // Create or update PortfolioItem for this company.
-      // We try to resolve an NSE symbol here, but do NOT hard-fail the report
-      // generation if resolution fails – that would be too aggressive for users.
+      // We try to resolve an NSE symbol here, but if resolution fails, we use
+      // the company_name (uppercase) as a fallback symbol to ensure PortfolioItem is always created.
       const today = new Date().toISOString().split('T')[0];
       const now = new Date();
 
       let portfolioItemId = null;
       const resolved = resolveNseSymbol(company_name);
 
-      if (!resolved) {
-        console.warn("[Portfolio] Unable to resolve NSE symbol for company:", company_name);
+      // Use resolved symbol/name if available, otherwise fallback to company_name
+      let symbol, resolvedCompanyName;
+      if (resolved) {
+        symbol = resolved.symbol;
+        resolvedCompanyName = resolved.company_name;
       } else {
-        const { symbol, company_name: resolvedCompanyName } = resolved;
+        // Fallback: use company_name as symbol (uppercase) when resolution fails
+        console.warn("[Portfolio] Unable to resolve NSE symbol for company:", company_name, "- using company_name as fallback symbol");
+        symbol = company_name.trim().toUpperCase();
+        resolvedCompanyName = company_name.trim();
+      }
 
-        let portfolioItem = await PortfolioItem.findOne({ 
-          user_id: userId, 
+      // Find or create PortfolioItem
+      let portfolioItem = await PortfolioItem.findOne({ 
+        user_id: userId, 
+        symbol,
+        item_date: { $gte: new Date(today) }
+      });
+
+      if (portfolioItem) {
+        // Update existing portfolio item
+        portfolioItemId = portfolioItem._id;
+        await PortfolioItem.updateOne(
+          { _id: portfolioItemId },
+          { $set: { company_name: resolvedCompanyName, updated_at: now } }
+        );
+      } else {
+        // Create new portfolio item (always create, even if symbol resolution failed)
+        const createdPortfolioItem = await PortfolioItem.create({
+          user_id: userId,
+          company_name: resolvedCompanyName,
           symbol,
-          item_date: { $gte: new Date(today) }
+          source_type: 'chat',
+          item_date: new Date(today)
         });
-
-        if (portfolioItem) {
-          // Update existing portfolio item
-          portfolioItemId = portfolioItem._id;
-          await PortfolioItem.updateOne(
-            { _id: portfolioItemId },
-            { $set: { company_name: resolvedCompanyName, updated_at: now } }
-          );
-        } else {
-          // Create new portfolio item with canonical symbol.
-          const createdPortfolioItem = await PortfolioItem.create({
-            user_id: userId,
-            company_name: resolvedCompanyName,
-            symbol,
-            source_type: 'chat',
-            item_date: new Date(today)
-          });
-          portfolioItemId = createdPortfolioItem._id;
-        }
+        portfolioItemId = createdPortfolioItem._id;
       }
 
       // Save report to Report model and link to PortfolioItem
@@ -2002,8 +2199,17 @@ app.post("/chat/create-report", loginRequired, async (req, res) => {
         report_data: reportId, // Store report ID for reference (used to generate download URL)
         report_type: 'equity_research',
         report_date: new Date(),
-        created_at: new Date()
+        created_at: new Date(),
+        // Store price data extracted from report
+        current_price: currentPrice,
+        target_price: targetPrice
       });
+
+      // Save structured report data to reportData collection
+      // This extracts and stores all numeric values for later reuse (e.g., price analysis)
+      if (reportData && savedReport && savedReport._id) {
+        await saveReportDataFromLLM(savedReport._id, reportData, company_name);
+      }
 
       // Save chat history
       if (!session_id) {
@@ -2044,14 +2250,23 @@ app.post("/reports/:id/approve", loginRequired, async (req, res) => {
       return res.status(404).json({ error: "Report not found" });
     }
 
+    // Capture prices at approval time (use current_price/target_price if available, otherwise keep existing approved prices)
+    const updateData = {
+      status: 'approved',
+      approved_at: new Date()
+    };
+
+    // If report has current_price/target_price, copy them to approved_current_price/approved_target_price
+    if (report.current_price !== null && report.current_price !== undefined) {
+      updateData.approved_current_price = report.current_price;
+    }
+    if (report.target_price !== null && report.target_price !== undefined) {
+      updateData.approved_target_price = report.target_price;
+    }
+
     await Report.updateOne(
       { _id: reportId },
-      {
-        $set: {
-          status: 'approved',
-          approved_at: new Date()
-        }
-      }
+      { $set: updateData }
     );
 
     return res.json({ success: true, message: "Report approved successfully" });
@@ -2087,6 +2302,13 @@ app.post("/reports/:id/delete", loginRequired, async (req, res) => {
       }
     }
 
+    // Delete associated reportData (best-effort)
+    try {
+      await deleteReportDataByReportId(reportId);
+    } catch (e) {
+      console.warn("[ReportData] Failed to delete reportData:", e?.message || e);
+    }
+
     await Report.deleteOne({ _id: reportId });
 
     return res.json({ success: true, message: "Report deleted successfully" });
@@ -2095,6 +2317,107 @@ app.post("/reports/:id/delete", loginRequired, async (req, res) => {
     res.status(500).json({ error: "Failed to delete report" });
   }
 });
+
+// Get report data by report_id (for Price Analysis feature)
+app.get("/reports/:id/data", loginRequired, async (req, res) => {
+  const reportId = req.params.id;
+  const userId = req.user._id;
+
+  try {
+    if (!mongooseConnected) {
+      return res.status(500).json({ error: "Database not connected" });
+    }
+
+    // Verify report belongs to user
+    const report = await Report.findOne({ _id: reportId, user_id: userId });
+    if (!report) {
+      return res.status(404).json({ error: "Report not found" });
+    }
+
+    // Fetch report data
+    const reportData = await getReportDataByReportId(reportId);
+    if (!reportData) {
+      return res.status(404).json({ error: "Report data not found" });
+    }
+
+    return res.json({ success: true, data: reportData });
+  } catch (e) {
+    console.error("[ReportData] Get error:", e);
+    res.status(500).json({ error: "Failed to fetch report data" });
+  }
+});
+
+// Get price data by report_id (convenience endpoint for Price Analysis)
+app.get("/reports/:id/prices", loginRequired, async (req, res) => {
+  const reportId = req.params.id;
+  const userId = req.user._id;
+
+  try {
+    if (!mongooseConnected) {
+      return res.status(500).json({ error: "Database not connected" });
+    }
+
+    // Verify report belongs to user
+    const report = await Report.findOne({ _id: reportId, user_id: userId });
+    if (!report) {
+      return res.status(404).json({ error: "Report not found" });
+    }
+
+    // Fetch price data
+    const priceData = await getPriceDataByReportId(reportId);
+    if (!priceData) {
+      return res.status(404).json({ error: "Price data not found" });
+    }
+
+    return res.json({ success: true, data: priceData });
+  } catch (e) {
+    console.error("[ReportData] Get price error:", e);
+    res.status(500).json({ error: "Failed to fetch price data" });
+  }
+});
+
+// Get report data by company_name
+app.get("/reports/company/:companyName/data", loginRequired, async (req, res) => {
+  const companyName = decodeURIComponent(req.params.companyName);
+  const limit = parseInt(req.query.limit) || 10;
+
+  try {
+    if (!mongooseConnected) {
+      return res.status(500).json({ error: "Database not connected" });
+    }
+
+    // Fetch report data list
+    const reportDataList = await getReportDataByCompanyName(companyName, limit);
+
+    return res.json({ success: true, data: reportDataList, count: reportDataList.length });
+  } catch (e) {
+    console.error("[ReportData] Get by company error:", e);
+    res.status(500).json({ error: "Failed to fetch report data" });
+  }
+});
+
+// Get price data by company_name (returns most recent)
+app.get("/reports/company/:companyName/prices", loginRequired, async (req, res) => {
+  const companyName = decodeURIComponent(req.params.companyName);
+
+  try {
+    if (!mongooseConnected) {
+      return res.status(500).json({ error: "Database not connected" });
+    }
+
+    // Fetch most recent price data
+    const priceData = await getPriceDataByCompanyName(companyName);
+    if (!priceData) {
+      return res.status(404).json({ error: "Price data not found for this company" });
+    }
+
+    return res.json({ success: true, data: priceData });
+  } catch (e) {
+    console.error("[ReportData] Get price by company error:", e);
+    res.status(500).json({ error: "Failed to fetch price data" });
+  }
+});
+
 // Azure-safe upload directory
 const upload = multer({
   dest: UPLOADS_DIR,
@@ -3040,6 +3363,51 @@ app.post("/api/market-intelligence", loginRequired, async (req, res) => {
     return res.status(500).json({
       status: "error",
       message: error.message || "Failed to fetch market intelligence"
+    });
+  }
+});
+
+/**
+ * POST /api/market-chatter
+ * Fetch market chatter analysis from external Market Chatter AI service
+ * Requires authentication
+ * 
+ * Request body:
+ * {
+ *   "query": "Wipro",  // required
+ *   "lookback_hours": 24,    // optional, default: 24
+ *   "max_results": 20        // optional, default: 20
+ * }
+ */
+app.post("/api/market-chatter", loginRequired, async (req, res) => {
+  try {
+    const { query, lookback_hours, max_results } = req.body;
+
+    // Validate required field
+    if (!query || typeof query !== 'string' || query.trim() === '') {
+      return res.status(400).json({
+        status: "error",
+        message: "Query is required and must be a non-empty string"
+      });
+    }
+
+    // Call the service wrapper
+    const result = await fetchMarketChatter({
+      query: query.trim(),
+      lookbackHours: lookback_hours,
+      maxResults: max_results
+    });
+
+    // Return the service response directly without transformation
+    return res.json(result);
+
+  } catch (error) {
+    console.error("[MarketChatter] Error:", error);
+    
+    // Return generic error message to frontend (do not leak stack traces)
+    return res.status(502).json({
+      status: "error",
+      message: "Market chatter service temporarily unavailable"
     });
   }
 });

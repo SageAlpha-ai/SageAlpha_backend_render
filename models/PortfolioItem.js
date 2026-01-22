@@ -1,6 +1,6 @@
 const mongoose = require('mongoose');
 
-/**
+/**e
  * PortfolioItem
  *
  * IMPORTANT:
