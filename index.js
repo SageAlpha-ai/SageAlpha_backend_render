@@ -458,7 +458,7 @@ app.get("/health", (req, res) => {
 
 app.post("/login", async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password, rememberMe } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({ success: false, message: "Email and password required" });
@@ -485,15 +485,18 @@ app.post("/login", async (req, res) => {
       }
     }
 
-    // Generate JWT
+    // Generate JWT with conditional expiry based on "Remember Me"
+    // If rememberMe is true: 7 days, otherwise: 1 hour
     const JWT_SECRET = process.env.JWT_SECRET;
     if (!JWT_SECRET && IS_PRODUCTION) {
       return res.status(500).json({ success: false, message: "Server configuration error" });
     }
+    
+    const expiresIn = rememberMe === true ? "7d" : "1h";
     const token = jwt.sign(
       { id: user._id },
       JWT_SECRET || "fallback_jwt_secret_DEV_ONLY",
-      { expiresIn: "7d" }
+      { expiresIn }
     );
 
     // Also set session for backward compatibility (LLM routes)
@@ -3500,6 +3503,35 @@ process.on('SIGTERM', () => {
       process.exit(0);
     }).catch(() => process.exit(1));
   });
+});
+
+// SPA Fallback Route - Serve index.html for all non-API routes
+// This allows React Router to handle client-side routing
+// Must be placed AFTER all API routes but BEFORE error handler
+app.get('*', (req, res, next) => {
+  // Skip if it's an API route, static file, or socket.io
+  if (
+    req.path.startsWith('/api') ||
+    req.path.startsWith('/static') ||
+    req.path.startsWith('/uploads') ||
+    req.path.startsWith('/socket.io') ||
+    req.path.startsWith('/health') ||
+    req.path.includes('.') // Has file extension (e.g., .js, .css, .png)
+  ) {
+    return next(); // Let Express handle 404 for these
+  }
+
+  // For all other routes, serve index.html (SPA routing)
+  // In production, serve from the built React app directory
+  // In development, this will be handled by Vite dev server
+  const indexPath = path.join(__dirname, 'static', 'index.html');
+  
+  if (fs.existsSync(indexPath)) {
+    return res.sendFile(indexPath);
+  }
+
+  // If index.html doesn't exist, continue to error handler
+  next();
 });
 
 // Express error handler (catch-all)
