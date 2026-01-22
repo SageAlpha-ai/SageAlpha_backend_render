@@ -1168,9 +1168,14 @@ app.post("/compliance/chat", loginRequired, async (req, res) => {
     );
 
     // Extract response - handle different possible field names
+    // IMPORTANT: Do NOT modify, replace, or manipulate the response text in any way
+    // Preserve all characters including dashes, underscores, asterisks, etc.
     let reply = null;
+    let sources = null;
+    
     if (response.data) {
       reply = response.data.answer || response.data.response || response.data.reply || response.data.text;
+      sources = response.data.sources || response.data.references || null;
       
       // If still no reply, try to get the entire response as string
       if (!reply && typeof response.data === 'string') {
@@ -1190,7 +1195,37 @@ app.post("/compliance/chat", loginRequired, async (req, res) => {
 
     console.log(`[Compliance Chat] Successfully received response from compliance API`);
     
-    return res.json({ reply: reply });
+    // DEBUG: Log a sample of the reply to verify URLs are preserved
+    if (reply && typeof reply === 'string' && reply.includes('sebi.gov.in')) {
+      // Try to find URLs with the specific pattern mentioned (may-19-2025-_94058)
+      const urlPattern = /https?:\/\/[^\s\)]+may-19-2025[^\s\)]+/g;
+      const urlMatches = reply.match(urlPattern);
+      if (urlMatches && urlMatches.length > 0) {
+        console.log(`[Compliance Chat] Found ${urlMatches.length} URLs with may-19-2025 pattern:`);
+        urlMatches.forEach((url, idx) => {
+          console.log(`[Compliance Chat] URL ${idx + 1}:`, url);
+          // Check specifically for the dash before underscore
+          if (url.includes('2025_')) {
+            console.warn(`[Compliance Chat] WARNING: URL missing dash before underscore!`);
+            console.warn(`[Compliance Chat] Expected: ...2025-_94058, Got:`, url);
+          }
+        });
+      }
+      // Also log a general sample
+      const generalUrlMatch = reply.match(/https?:\/\/[^\s\)]+/);
+      if (generalUrlMatch) {
+        console.log(`[Compliance Chat] General sample URL:`, generalUrlMatch[0]);
+      }
+    }
+    
+    // Return response exactly as received - no manipulation
+    // Use res.json() which will properly stringify without modifying content
+    const responseData = { reply: reply };
+    if (sources) {
+      responseData.sources = sources;
+    }
+    
+    return res.json(responseData);
 
   } catch (error) {
     console.error("[Compliance Chat] Error:", error.message);
