@@ -1435,13 +1435,13 @@ app.get("/portfolio/price-analysis", loginRequired, async (req, res) => {
       .map((item) => {
         const companyKey = normalizeCompanyKey(item.company_name || item.symbol || "");
         const latest = latestByCompany[companyKey];
-        return {
-          companyName: item.company_name || item.symbol || "Unknown",
+      return {
+        companyName: item.company_name || item.symbol || "Unknown",
           lastApprovedDate: latest?.created_at || null,
           approvedCurrentPrice: typeof latest?.current_price === "number" ? latest.current_price : null,
           approvedTargetPrice: typeof latest?.target_price === "number" ? latest.target_price : null,
           _hasReportData: !!latest
-        };
+      };
       })
       .filter((x) => x._hasReportData)
       .map(({ _hasReportData, ...rest }) => rest);
