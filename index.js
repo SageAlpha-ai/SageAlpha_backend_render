@@ -61,6 +61,7 @@ const Report = require('./models/Report');
 const Subscriber = require('./models/Subscriber');
 const UserPreference = require('./models/UserPreference');
 const ReportDelivery = require('./models/ReportDelivery');
+const SharedChat = require('./models/SharedChat');
 const axios = require("axios");
 const multer = require("multer");
 const { v4: uuidv4 } = require("uuid");
@@ -2105,19 +2106,96 @@ app.post("/reports/delete-all", loginRequired, async (req, res) => {
   res.status(500).json({ error: "Database not connected" });
 });
 
-app.post("/sessions/:id/share", loginRequired, async (req, res) => {
+// Share Chat - Create share link
+app.post("/api/chat/:chatId/share", loginRequired, async (req, res) => {
   const userId = req.user._id ? req.user._id : req.user.id;
-  const { id } = req.params;
+  const { chatId } = req.params;
 
-  if (mongooseConnected) {
-    const session = await ChatSession.findOne({ id, user_id: userId });
-    if (!session) return res.status(404).json({ error: "Session not found" });
-
-    // Mock share URL
-    const shareUrl = `${req.protocol}://${req.get('host')}/share/${id}`;
-    return res.json({ success: true, share_url: shareUrl });
+  if (!mongooseConnected) {
+    return res.status(500).json({ error: "Database not connected" });
   }
-  res.status(500).json({ error: "Database not connected" });
+
+  try {
+    // Fetch chat session
+    const session = await ChatSession.findOne({ id: chatId, user_id: userId });
+    if (!session) {
+      return res.status(404).json({ error: "Chat not found" });
+    }
+
+    // Fetch all messages for this chat
+    const messages = await Message.find({ session_id: chatId })
+      .sort({ _id: 1 })
+      .lean();
+
+    if (!messages || messages.length === 0) {
+      return res.status(400).json({ error: "Chat has no messages to share" });
+    }
+
+    // Create snapshot of messages
+    const messageSnapshot = messages.map(msg => ({
+      role: msg.role,
+      content: msg.content,
+      createdAt: msg.timestamp || msg.createdAt || new Date()
+    }));
+
+    // Generate unique shareId
+    const shareId = uuidv4();
+
+    // Create SharedChat document
+    const sharedChat = await SharedChat.create({
+      shareId,
+      originalChatId: chatId,
+      messages: messageSnapshot,
+      model: 'gpt-4', // Default model, can be enhanced later
+      createdAt: new Date(),
+      expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) // 30 days
+    });
+
+    // Generate share URL
+    const frontendUrl = process.env.FRONTEND_URL || process.env.CLIENT_URL || `${req.protocol}://${req.get('host')}`;
+    const shareUrl = `${frontendUrl}/share/${shareId}`;
+
+    return res.json({
+      success: true,
+      shareUrl: shareUrl
+    });
+  } catch (error) {
+    console.error("Error creating share link:", error);
+    return res.status(500).json({ error: "Failed to create share link" });
+  }
+});
+
+// Get Shared Chat - Public, read-only endpoint
+app.get("/api/share/:shareId", async (req, res) => {
+  const { shareId } = req.params;
+
+  if (!mongooseConnected) {
+    return res.status(500).json({ error: "Database not connected" });
+  }
+
+  try {
+    // Find shared chat
+    const sharedChat = await SharedChat.findOne({ shareId }).lean();
+
+    if (!sharedChat) {
+      return res.status(404).json({ error: "Shared chat not found" });
+    }
+
+    // Check if expired
+    if (sharedChat.expiresAt && new Date(sharedChat.expiresAt) < new Date()) {
+      return res.status(410).json({ error: "This shared chat has expired" });
+    }
+
+    // Return chat data (read-only)
+    return res.json({
+      messages: sharedChat.messages || [],
+      model: sharedChat.model || 'gpt-4',
+      createdAt: sharedChat.createdAt
+    });
+  } catch (error) {
+    console.error("Error fetching shared chat:", error);
+    return res.status(500).json({ error: "Failed to fetch shared chat" });
+  }
 });
 
 app.post("/chat/create-report", loginRequired, async (req, res) => {
