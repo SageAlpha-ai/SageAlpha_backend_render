@@ -309,6 +309,36 @@ UPLOADS_DIR=/home/data/uploads
 
 ---
 
+### 21. `GOOGLE_CLIENT_ID`
+- **Description**: Google OAuth 2.0 Client ID for "Sign in with Google" feature
+- **Format**: Google OAuth Client ID string
+- **Example**: `123456789-abcdefghijklmnopqrstuvwxyz.apps.googleusercontent.com`
+- **Required**: ❌ NO (Google OAuth will be disabled if not set)
+- **How to get**: 
+  1. Go to [Google Cloud Console](https://console.cloud.google.com/)
+  2. Create a new project or select existing
+  3. Enable Google+ API
+  4. Go to "Credentials" → "Create Credentials" → "OAuth client ID"
+  5. Configure OAuth consent screen
+  6. Add authorized redirect URI: `https://your-backend-url/auth/google/callback`
+  7. Copy the Client ID
+
+### 22. `GOOGLE_CLIENT_SECRET`
+- **Description**: Google OAuth 2.0 Client Secret for "Sign in with Google" feature
+- **Format**: Google OAuth Client Secret string
+- **Example**: `GOCSPX-abcdefghijklmnopqrstuvwxyz`
+- **Required**: ❌ NO (must be set if GOOGLE_CLIENT_ID is set)
+- **How to get**: Same as GOOGLE_CLIENT_ID, copy the Client Secret
+
+### 23. `FRONTEND_URL` (or `CLIENT_URL`)
+- **Description**: Frontend URL for OAuth redirects after Google authentication
+- **Format**: Full URL without trailing slash
+- **Example**: `https://blue-cliff-080a39310.4.azurestaticapps.net` or `http://localhost:5173`
+- **Required**: ❌ NO (falls back to ALLOWED_ORIGINS[0] or localhost:5173 in dev)
+- **Note**: Used to redirect users after Google OAuth callback
+
+---
+
 **Last Updated**: 2024
 **Version**: 3.0.0
 

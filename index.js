@@ -66,6 +66,7 @@ const axios = require("axios");
 const multer = require("multer");
 const { v4: uuidv4 } = require("uuid");
 const cookieParser = require("cookie-parser");
+const passport = require("passport");
 
 const http = require("http");
 const { Server } = require("socket.io");
@@ -385,6 +386,29 @@ app.use(
   })
 );
 
+// Initialize Passport (for Google OAuth)
+// Note: We don't use sessions for OAuth, but Passport requires session middleware
+app.use(passport.initialize());
+app.use(passport.session());
+
+// Configure Google OAuth Strategy
+const configureGoogleStrategy = require('./backend/auth/googleStrategy');
+configureGoogleStrategy();
+
+// Passport serialization (minimal - we use JWT, not sessions)
+passport.serializeUser((user, done) => {
+  done(null, user._id);
+});
+
+passport.deserializeUser(async (id, done) => {
+  try {
+    const user = await User.findById(id);
+    done(null, user);
+  } catch (error) {
+    done(error, null);
+  }
+});
+
 
 // User Loader Middleware (supporting both Session and JWT)
 app.use(async (req, res, next) => {
@@ -474,6 +498,14 @@ app.post("/login", async (req, res) => {
       return res.status(401).json({ success: false, message: "Invalid credentials" });
     }
 
+    // Check if user is a Google OAuth user (should not use password login)
+    if (user.authProvider === 'google' || user.googleId) {
+      return res.status(401).json({ 
+        success: false, 
+        message: "This account uses Google Sign-In. Please sign in with Google instead." 
+      });
+    }
+
     // Compare password (using password_hash from Mongoose model)
     const isMatch = await bcrypt.compare(password, user.password_hash || "");
     if (!isMatch) {
@@ -512,6 +544,8 @@ app.post("/login", async (req, res) => {
         id: user._id,
         name: user.display_name || user.username,
         email: user.email,
+        avatar: user.avatar || null,
+        authProvider: user.authProvider || 'local',
       },
     });
   } catch (error) {
@@ -530,6 +564,91 @@ app.post("/logout", (req, res) => {
     res.status(200).json({ success: true, message: "Logged out successfully" });
   });
 });
+
+// ==========================================
+// GOOGLE OAUTH ROUTES
+// ==========================================
+
+/**
+ * GET /auth/google
+ * Initiates Google OAuth flow
+ * Redirects user to Google's consent screen
+ */
+app.get("/auth/google", (req, res, next) => {
+  const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+  if (!GOOGLE_CLIENT_ID) {
+    return res.status(503).json({ 
+      success: false, 
+      message: "Google OAuth is not configured" 
+    });
+  }
+  
+  // Use Passport to authenticate with Google
+  passport.authenticate('google', {
+    scope: ['profile', 'email']
+  })(req, res, next);
+});
+
+/**
+ * GET /auth/google/callback
+ * Google OAuth callback handler
+ * - Verifies Google response
+ * - Finds or creates user
+ * - Generates JWT token (7 days)
+ * - Redirects to frontend with token
+ */
+app.get("/auth/google/callback", 
+  passport.authenticate('google', { session: false, failureRedirect: '/login?error=google_auth_failed' }),
+  async (req, res) => {
+    try {
+      if (!req.user) {
+        return res.redirect('/login?error=google_auth_failed');
+      }
+
+      const user = req.user;
+
+      // Generate JWT token (7 days expiry for OAuth users)
+      const JWT_SECRET = process.env.JWT_SECRET;
+      if (!JWT_SECRET && IS_PRODUCTION) {
+        console.error('[GOOGLE OAUTH] JWT_SECRET not configured');
+        return res.redirect('/login?error=server_config');
+      }
+
+      const token = jwt.sign(
+        { id: user._id },
+        JWT_SECRET || "fallback_jwt_secret_DEV_ONLY",
+        { expiresIn: "7d" }
+      );
+
+      // Set session for backward compatibility (LLM routes)
+      req.session.userId = user._id.toString();
+      req.session.save();
+
+      // Get frontend URL from environment or construct from request
+      const FRONTEND_URL = process.env.FRONTEND_URL || 
+                          process.env.CLIENT_URL || 
+                          (IS_PRODUCTION ? 
+                            (process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',')[0].trim() : null) :
+                            'http://localhost:5173'
+                          );
+
+      if (!FRONTEND_URL) {
+        console.error('[GOOGLE OAUTH] FRONTEND_URL not configured');
+        return res.redirect('/login?error=server_config');
+      }
+
+      // Remove trailing slash
+      const frontendUrl = FRONTEND_URL.replace(/\/$/, '');
+      
+      // Redirect to frontend with token
+      const redirectUrl = `${frontendUrl}/oauth-success?token=${token}`;
+      res.redirect(redirectUrl);
+    } catch (error) {
+      console.error('[GOOGLE OAUTH] Callback error:', error);
+      res.redirect('/login?error=server_error');
+    }
+  }
+);
 
 app.post("/forgot-password", async (req, res) => {
   try {
@@ -1966,11 +2085,14 @@ app.delete("/subscribers/:id", loginRequired, async (req, res) => {
 
 app.get("/user", loginRequired, (req, res) => {
   res.json({
-    id: req.user.id,
+    id: req.user._id || req.user.id,
+    _id: req.user._id || req.user.id,
     username: req.user.username,
     email: req.user.email,
     display_name: req.user.display_name,
-    avatar_url: null
+    avatar: req.user.avatar || null,
+    avatar_url: req.user.avatar || null,
+    authProvider: req.user.authProvider || 'local'
   });
 });
 
