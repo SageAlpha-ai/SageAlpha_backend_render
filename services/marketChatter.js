@@ -1,6 +1,6 @@
 const axios = require("axios");
 
-const MARKET_CHATTER_AI_BASE_URL = process.env.MARKET_CHATTER_AI_BASE_URL || "https://market-chatter-ai.onrender.com";
+const MARKET_CHATTER_AI_BASE_URL = process.env.MARKET_CHATTER_AI_BASE_URL || "https://market-chatter-ai-ebg9bnfjcte9f6ds.centralus-01.azurewebsites.net";
 const REQUEST_TIMEOUT = 20000; // 20 seconds
 
 /**

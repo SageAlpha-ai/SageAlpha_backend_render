@@ -152,12 +152,12 @@ Set these only if you want persistent file storage (not ephemeral `/tmp`).
 - **Required**: ❌ NO (defaults to 5 minutes)
 
 ### 19. `MARKET_CHATTER_AI_BASE_URL`
-- **Description**: Base URL for the external Market Chatter AI service
-- **Format**: `https://market-chatter-ai.onrender.com`
-- **Example**: `https://market-chatter-ai.onrender.com`
+- **Description**: Base URL for the external Market Chatter AI service (Azure)
+- **Format**: Full URL without trailing slash
+- **Example**: `https://market-chatter-ai-ebg9bnfjcte9f6ds.centralus-01.azurewebsites.net`
 - **Required**: ❌ NO (has default)
-- **Default**: `https://market-chatter-ai.onrender.com`
-- **Where to set**: Azure Portal → App Service → Configuration → Application Settings (optional)
+- **Default**: `https://market-chatter-ai-ebg9bnfjcte9f6ds.centralus-01.azurewebsites.net` (Azure)
+- **Note**: Automatically used by backend `/api/market-chatter` endpoint to proxy requests
 
 ### 20. `AGENTIC_AI_BASE_URL`
 - **Description**: Base URL for the external agentic AI service (market chatter intelligence)

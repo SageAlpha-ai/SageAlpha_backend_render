@@ -883,7 +883,7 @@ class VectorStore {
 const vs = new VectorStore(VECTOR_STORE_DIR);
 
 // --- RAG Service Configuration ---
-const RAG_API_URL = process.env.RAG_API_URL || "https://sagealpha-rag-llm.onrender.com";
+const RAG_API_URL = process.env.RAG_API_URL || "https://financial-rag-websearch-model-auhbdtdpgug6awht.centralindia-01.azurewebsites.net";
 const RAG_API_KEY = process.env.RAG_API_KEY;
 
 let ragMode = "none"; // rag, mock
