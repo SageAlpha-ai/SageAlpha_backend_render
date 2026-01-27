@@ -221,7 +221,7 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
   : IS_PRODUCTION
     ? [] // Production MUST set ALLOWED_ORIGINS
-    : ["http://localhost:5173", "http://localhost:3000","http://localhost:5174","http://localhost:5175","http://localhost:5175"]; // Dev fallback
+    : ["http://localhost:5173", "http://localhost:3000","http://localhost:5174","http://localhost:5175","http://localhost:5175","https://sagealphaai.onrender.com"]; // Dev fallback
 
 if (IS_PRODUCTION && allowedOrigins.length === 0) {
   console.warn('[CORS] WARNING: ALLOWED_ORIGINS not set in production! CORS may fail.');
@@ -1580,6 +1580,30 @@ app.get("/portfolio/price-analysis", loginRequired, async (req, res) => {
 /**
  * GET /api/notifications
  * Fetch notifications for the logged-in user from Agentic AI database
+ * 
+ * SECURITY: Symbol-based filtering prevents cross-user data leakage
+ * 
+ * Why symbol-scoped?
+ * - Notifications are GLOBAL events written by Alert AI Agent
+ * - notification.user_id is NOT reliable (not set by AI agent)
+ * - Users should ONLY see notifications for symbols in their portfolio
+ * 
+ * Why symbol is the join key?
+ * - symbol is the SINGLE SOURCE OF TRUTH (uppercase, NSE-compatible)
+ * - Both notifications and portfolio_items use symbol field
+ * - This ensures consistent matching across collections
+ * 
+ * Filtering Logic:
+ * 1. Fetch user's portfolio symbols (portfolio_items.symbol WHERE user_id = current user)
+ * 2. Filter notifications WHERE notification.symbol IN portfolioSymbols
+ * 3. MongoDB $in query ensures efficient filtering at database level
+ * 
+ * Indexes Required:
+ * - portfolio_items.user_id (for user lookup)
+ * - portfolio_items.symbol (for symbol extraction)
+ * - notifications.symbol (for $in query performance)
+ * - notifications.created_at (for sorting)
+ * 
  * Returns notifications sorted by created_at descending with unread count
  */
 app.get("/api/notifications", loginRequired, async (req, res) => {
@@ -1592,17 +1616,52 @@ app.get("/api/notifications", loginRequired, async (req, res) => {
       });
     }
 
+    if (!mongooseConnected) {
+      return res.status(503).json({ 
+        error: "Database service unavailable",
+        notifications: [],
+        unread_count: 0
+      });
+    }
+
     const userId = req.user._id ? req.user._id.toString() : req.user.id;
 
-    // Fetch all notifications (ignoring user_id field as per requirements)
+    // Step 1: Fetch user's portfolio symbols
+    // This query uses index on portfolio_items.user_id for performance
+    const portfolioItems = await PortfolioItem.find({ user_id: userId })
+      .select('symbol')
+      .lean();
+
+    // Extract unique symbols (uppercase, NSE-compatible)
+    // Symbol is already uppercase in schema, but ensure consistency
+    const portfolioSymbols = [...new Set(
+      portfolioItems
+        .map(item => item.symbol?.toUpperCase())
+        .filter(symbol => symbol) // Remove null/undefined
+    )];
+
+    // If user has no portfolio items, return empty notifications
+    // This prevents users from seeing notifications for symbols they don't own
+    if (portfolioSymbols.length === 0) {
+      return res.json({
+        notifications: [],
+        unread_count: 0
+      });
+    }
+
+    // Step 2: Fetch notifications filtered by portfolio symbols
+    // MongoDB $in query filters at database level (efficient)
+    // Uses index on notifications.symbol for optimal performance
     // Sort by created_at descending (newest first)
     const notifications = await notificationsDb
       .collection('notifications')
-      .find({})
+      .find({
+        symbol: { $in: portfolioSymbols }
+      })
       .sort({ created_at: -1 })
       .toArray();
 
-    // Calculate unread count
+    // Calculate unread count from filtered results
     const unreadCount = notifications.filter(n => !n.is_read).length;
 
     // Format notifications for response
@@ -1635,13 +1694,30 @@ app.get("/api/notifications", loginRequired, async (req, res) => {
 /**
  * PATCH /api/notifications/:id/read
  * Mark a notification as read
- * Validates notification exists before updating
+ * 
+ * SECURITY: Validates user owns the symbol before allowing read
+ * 
+ * Why validate symbol ownership?
+ * - Prevents users from marking notifications as read for symbols they don't own
+ * - Ensures users can only interact with notifications they have access to
+ * - Maintains data integrity and prevents cross-user data manipulation
+ * 
+ * Validation Logic:
+ * 1. Find notification by ID
+ * 2. Verify user has the notification's symbol in their portfolio
+ * 3. Only then allow marking as read
  */
 app.patch("/api/notifications/:id/read", loginRequired, async (req, res) => {
   try {
     if (!notificationsDbConnected || !notificationsDb) {
       return res.status(503).json({ 
         error: "Notifications service unavailable"
+      });
+    }
+
+    if (!mongooseConnected) {
+      return res.status(503).json({ 
+        error: "Database service unavailable"
       });
     }
 
@@ -1660,6 +1736,21 @@ app.patch("/api/notifications/:id/read", loginRequired, async (req, res) => {
 
     if (!notification) {
       return res.status(404).json({ error: "Notification not found" });
+    }
+
+    // SECURITY: Validate user owns the symbol in their portfolio
+    // This prevents users from marking notifications as read for symbols they don't own
+    if (notification.symbol) {
+      const userOwnsSymbol = await PortfolioItem.exists({
+        user_id: userId,
+        symbol: notification.symbol.toUpperCase()
+      });
+
+      if (!userOwnsSymbol) {
+        return res.status(403).json({ 
+          error: "You do not have access to this notification" 
+        });
+      }
     }
 
     // Update notification to mark as read

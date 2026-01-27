@@ -11,7 +11,7 @@ const UserSchema = new mongoose.Schema({
   is_active: { type: Boolean, default: true },
   is_waitlist: { type: Boolean, default: false },
   otp_code: { type: String, default: null },
-  otp_expires: { type: Date, default: null }
+otp_expires: { type: Date, default: null }
 
 }, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } });
 
