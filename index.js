@@ -1274,7 +1274,7 @@ app.post("/compliance/chat", loginRequired, async (req, res) => {
       return res.status(400).json({ error: "Query is required and must be a non-empty string" });
     }
 
-    const complianceApiUrl = "https://sagealpha-compliance.onrender.com/query";
+    const complianceApiUrl = "https://compliance-rag-api.azurewebsites.net/query";
     
     console.log(`[Compliance Chat] Forwarding query to compliance API: ${complianceApiUrl}`);
     
