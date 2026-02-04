@@ -1,6 +1,6 @@
 const { BlobServiceClient } = require("@azure/storage-blob");
 
-const CONTAINER_NAME = process.env.AZURE_CONTAINER_NAME || "equity-html-reports";
+const CONTAINER_NAME = process.env.AZURE_CONTAINER_NAME || "html-pdf-report";
 const CONNECTION_STRING = process.env.AZURE_BLOB_CONNECTION_STRING;
 
 if (!CONNECTION_STRING) {

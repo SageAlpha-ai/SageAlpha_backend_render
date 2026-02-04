@@ -1379,6 +1379,132 @@ app.post("/compliance/chat", loginRequired, async (req, res) => {
   }
 });
 
+/**
+ * POST /defender/query
+ * 
+ * Proxy endpoint for Defender AI queries.
+ * This endpoint forwards queries to the Defender AI service while keeping
+ * the Defender AI URL and credentials secure on the backend.
+ * 
+ * Request body:
+ * {
+ *   "query": string (required, non-empty)
+ * }
+ * 
+ * Returns Defender AI response as-is:
+ * {
+ *   "query": string,
+ *   "answer": string (markdown),
+ *   "method": string,
+ *   "confidence": number (0-1),
+ *   "sources": array,
+ *   "flags": array,
+ *   "disclaimer": string
+ * }
+ */
+app.post("/defender/query", loginRequired, async (req, res) => {
+  try {
+    const { query } = req.body;
+    
+    // Validate input
+    if (!query || typeof query !== 'string' || query.trim().length === 0) {
+      return res.status(400).json({ 
+        error: "Query is required and must be a non-empty string" 
+      });
+    }
+
+    // Get Defender AI endpoint from environment variable
+    const defenderAiEndpoint = process.env.DEFENDER_AI_Endpoint || process.env.DEFENDER_AI_BASE_URL;
+    
+    if (!defenderAiEndpoint) {
+      console.error("[Defender AI] DEFENDER_AI_Endpoint environment variable is not set");
+      return res.status(500).json({ 
+        error: "Defender AI service is not configured",
+        answer: "Sorry, the Defender AI service is not available. Please contact support."
+      });
+    }
+
+    // Ensure endpoint ends with /query
+    const defenderAiUrl = defenderAiEndpoint.endsWith('/query') 
+      ? defenderAiEndpoint 
+      : `${defenderAiEndpoint.replace(/\/$/, '')}/query`;
+
+    console.log(`[Defender AI] Forwarding query to Defender AI service`);
+    
+    // Forward query to Defender AI API (server-side only)
+    const response = await axios.post(
+      defenderAiUrl,
+      { query: query.trim() },
+      {
+        headers: {
+          "Content-Type": "application/json",
+        },
+        timeout: 30000, // 30 second timeout
+      }
+    );
+
+    // Return Defender AI response as-is (no mutation)
+    if (!response.data) {
+      throw new Error("No response received from Defender AI");
+    }
+
+    console.log(`[Defender AI] Successfully received response from Defender AI`);
+    
+    // Return response exactly as received from Defender AI
+    return res.json(response.data);
+
+  } catch (error) {
+    console.error("[Defender AI] Error:", error.message);
+    
+    // Handle axios errors specifically
+    if (error.response) {
+      // The request was made and the server responded with a status code outside 2xx
+      console.error("[Defender AI] API responded with error:", error.response.status, error.response.data);
+      return res.status(502).json({ 
+        error: "Defender AI service returned an error",
+        answer: "Sorry, the Defender AI service returned an error. Please try again later.",
+        confidence: null,
+        sources: [],
+        flags: [],
+        disclaimer: ""
+      });
+    } else if (error.request) {
+      // The request was made but no response was received
+      console.error("[Defender AI] No response from Defender AI API");
+      return res.status(503).json({ 
+        error: "Defender AI service is unreachable",
+        answer: "Sorry, I couldn't reach the Defender AI service. Please check your connection and try again.",
+        confidence: null,
+        sources: [],
+        flags: [],
+        disclaimer: ""
+      });
+    } else if (error.code === 'ECONNABORTED') {
+      // Timeout error
+      console.error("[Defender AI] Request timeout");
+      return res.status(504).json({ 
+        error: "Request timeout",
+        answer: "Sorry, the request timed out. Please try again with a shorter question.",
+        confidence: null,
+        sources: [],
+        flags: [],
+        disclaimer: ""
+      });
+    } else {
+      // Something happened in setting up the request
+      console.error("[Defender AI] Request setup error:", error.message);
+      return res.status(500).json({ 
+        error: "Internal server error",
+        answer: "Sorry, an unexpected error occurred. Please try again later.",
+        confidence: null,
+        sources: [],
+        flags: [],
+        disclaimer: ""
+      });
+    }
+  }
+});
+
 // ==========================================
 // 7. PORTFOLIO ROUTES
 // ==========================================
@@ -1515,6 +1641,49 @@ app.get("/portfolio/items/:id/price-analysis", loginRequired, async (req, res) =
  *   kept as null until market-price capture is implemented at approval time (future enhancement).
  *   Do NOT break existing approval/portfolio workflows.
  */
+/**
+ * Helper function to fetch current price from Yahoo Finance
+ * Returns null if price cannot be fetched (does not throw)
+ */
+const fetchYahooPrice = async (symbol) => {
+  if (!symbol || typeof symbol !== 'string' || symbol.trim() === '') {
+    return null;
+  }
+
+  // Append .NS for NSE stocks
+  const yahooSymbol = symbol.toUpperCase().trim() + '.NS';
+  
+  try {
+    const yahooResponse = await axios.get(
+      `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSymbol}?interval=1d&range=1d`,
+      {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+          'Accept': 'application/json'
+        },
+        timeout: 10000
+      }
+    );
+
+    const yahooData = yahooResponse.data;
+    
+    // Extract price from meta.regularMarketPrice
+    if (yahooData?.chart?.result?.[0]?.meta?.regularMarketPrice) {
+      const price = yahooData.chart.result[0].meta.regularMarketPrice;
+      if (typeof price === 'number' && !isNaN(price) && price > 0) {
+        console.log(`[Price Analysis] Fetched price for ${yahooSymbol}:`, price);
+        return price;
+      }
+    }
+    
+    console.warn(`[Price Analysis] No price found for ${yahooSymbol}`);
+    return null;
+  } catch (error) {
+    console.error(`[Price Analysis] Yahoo API error for ${yahooSymbol}:`, error.message);
+    return null;
+  }
+};
+
 app.get("/portfolio/price-analysis", loginRequired, async (req, res) => {
   try {
     if (!mongooseConnected) {
@@ -1523,8 +1692,14 @@ app.get("/portfolio/price-analysis", loginRequired, async (req, res) => {
 
     const userId = req.user._id;
 
-    // Get all portfolio items for the user
-    const portfolioItems = await PortfolioItem.find({ user_id: userId }).sort({ updated_at: -1 }).lean();
+    // Get ONLY approved portfolio items for the user
+    // This ensures Performance Dashboard only shows finalized items
+    const portfolioItems = await PortfolioItem.find({ 
+      user_id: userId, 
+      approved: true 
+    }).sort({ approved_at: -1 }).lean();
+    
+    console.log(`[Price Analysis] Found ${portfolioItems.length} approved portfolio items`);
 
     // We only want to use *persisted* data from reportData for the "Last Approved" column.
     // To keep scope tight and avoid re-parsing, we:
@@ -1549,24 +1724,49 @@ app.get("/portfolio/price-analysis", loginRequired, async (req, res) => {
       }
     }
 
-    // Build response array:
-    // Only include companies that exist in reportData (per requirement) to avoid placeholders.
-    const items = portfolioItems
+    // Build base items array - use approved_at from portfolio item as Approved Date
+    const baseItems = portfolioItems
       .map((item) => {
         const companyKey = normalizeCompanyKey(item.company_name || item.symbol || "");
         const latest = latestByCompany[companyKey];
       return {
         companyName: item.company_name || item.symbol || "Unknown",
-          lastApprovedDate: latest?.created_at || null,
-          approvedCurrentPrice: typeof latest?.current_price === "number" ? latest.current_price : null,
-          approvedTargetPrice: typeof latest?.target_price === "number" ? latest.target_price : null,
+          symbol: item.symbol || null,
+          approvedDate: item.approved_at || null, // Use portfolio item's approved_at
+          recommendedPrice: typeof latest?.current_price === "number" ? latest.current_price : null,
+          targetPrice: typeof latest?.target_price === "number" ? latest.target_price : null,
           _hasReportData: !!latest
       };
       })
       .filter((x) => x._hasReportData)
       .map(({ _hasReportData, ...rest }) => rest);
 
-    return res.json({ items });
+    // Fetch current prices from Yahoo Finance for each item (one by one)
+    console.log(`[Price Analysis] Fetching current prices for ${baseItems.length} items`);
+    const itemsWithPrices = await Promise.all(
+      baseItems.map(async (item) => {
+        let currentPrice = null;
+        
+        // Only fetch if we have a symbol
+        if (item.symbol) {
+          currentPrice = await fetchYahooPrice(item.symbol);
+        } else {
+          console.warn(`[Price Analysis] No symbol for ${item.companyName}, skipping price fetch`);
+        }
+
+        return {
+          companyName: item.companyName,
+          symbol: item.symbol,
+          approvedDate: item.approvedDate, // Already set from portfolio item's approved_at
+          recommendedPrice: item.recommendedPrice,
+          targetPrice: item.targetPrice,
+          currentPrice: currentPrice
+        };
+      })
+    );
+
+    console.log(`[Price Analysis] Returning ${itemsWithPrices.length} items with prices`);
+    return res.json({ items: itemsWithPrices });
   } catch (e) {
     console.error("[Price Analysis] Error:", e);
     return res.status(500).json({ error: "Failed to fetch price analysis" });
@@ -1858,6 +2058,8 @@ app.post("/portfolio/add", loginRequired, async (req, res) => {
         symbol,
         source_type: "chat",
         item_date: new Date(today),
+        approved: false, // New items are not approved by default
+        approved_at: null, // Set when item is approved
       });
       itemId = created._id;
 
@@ -2597,6 +2799,20 @@ app.post("/reports/:id/approve", loginRequired, async (req, res) => {
       { _id: reportId },
       { $set: updateData }
     );
+
+    // Also approve the associated portfolio item
+    if (report.portfolio_item_id) {
+      await PortfolioItem.updateOne(
+        { _id: report.portfolio_item_id, user_id: userId },
+        {
+          $set: {
+            approved: true,
+            approved_at: new Date()
+          }
+        }
+      );
+      console.log(`[Report] Approved portfolio item ${report.portfolio_item_id} along with report ${reportId}`);
+    }
 
     return res.json({ success: true, message: "Report approved successfully" });
   } catch (e) {
@@ -3840,7 +4056,7 @@ app.use((err, req, res, next) => {
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`[SageAlpha Node] Server running on port ${PORT}`);
   console.log(`[SageAlpha Node] Environment: ${IS_PRODUCTION ? 'PRODUCTION' : 'DEVELOPMENT'}`);
-  console.log(`[SageAlpha Node] HTML Reports Storage: Azure Blob Storage (Container: ${process.env.AZURE_CONTAINER_NAME || 'equity-html-reports'})`);
+  console.log(`[SageAlpha Node] HTML Reports Storage: Azure Blob Storage (Container: ${process.env.AZURE_CONTAINER_NAME || 'html-pdf-report'})`);
   console.log(`[SageAlpha Node] Uploads Dir: ${UPLOADS_DIR}`);
   if (!IS_PRODUCTION) {
     console.log(`[SageAlpha Node] Local URL: http://localhost:${PORT}`);

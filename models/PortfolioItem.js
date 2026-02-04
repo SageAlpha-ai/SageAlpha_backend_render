@@ -35,6 +35,15 @@ const PortfolioItemSchema = new mongoose.Schema(
       type: Date,
       default: () => new Date(),
     },
+    approved: {
+      type: Boolean,
+      default: false,
+      index: true, // Index for efficient filtering in Performance Dashboard
+    },
+    approved_at: {
+      type: Date,
+      default: null,
+    },
   },
   {
     // Use snake_case timestamps to match existing schema conventions
