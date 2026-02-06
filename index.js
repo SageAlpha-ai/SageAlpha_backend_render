@@ -463,6 +463,28 @@ function loginRequired(req, res, next) {
   }
   next();
 }
+
+/**
+ * Safely resolve user ID from request
+ * Returns user ID if authenticated, or "demo-user" for demo mode
+ * @param {Object} req - Express request object
+ * @returns {string|ObjectId} User ID or "demo-user" string
+ */
+function resolveUserId(req) {
+  if (req.user) {
+    return req.user._id || req.user.id;
+  }
+  return "demo-user";
+}
+
+/**
+ * Check if request is from authenticated user
+ * @param {Object} req - Express request object
+ * @returns {boolean} True if authenticated, false if demo mode
+ */
+function isAuthenticated(req) {
+  return !!req.user;
+}
 // ==========================================
 // 4. AUTH & USER ROUTES
 // ==========================================
@@ -1155,36 +1177,33 @@ app.post("/chat", async (req, res) => {
     const { message, session_id, top_k } = req.body;
     if (!message) return res.status(400).json({ error: "Empty message" });
 
-    // const userId = req.user._id ? req.user._id : req.user.id;
-    let userId;
-
-    if (req.user) {
-      userId = req.user._id || req.user.id;
-    } else {
-      userId = new mongoose.Types.ObjectId();; // or generate temp ID
-    }
+    // Safely resolve user ID (returns "demo-user" if not authenticated)
+    const userId = resolveUserId(req);
+    const isAuth = isAuthenticated(req);
 
     let chatId = session_id;
 
-    // 1. Session Management
+    // 1. Session Management (skip DB operations for demo users)
     let dbSession = null;
-    if (mongooseConnected) {
+    if (mongooseConnected && isAuth) {
       if (chatId) dbSession = await ChatSession.findOne({ id: chatId, user_id: userId });
       if (!dbSession) {
-        chatId = uuidv4();
+        chatId = chatId || uuidv4();
         await ChatSession.create({ id: chatId, user_id: userId, title: 'New Chat' });
       }
+    } else if (!chatId) {
+      // Generate session ID for demo users (not persisted)
+      chatId = uuidv4();
     }
 
-    // 2. Save User Message
-    if (mongooseConnected) {
+    // 2. Save User Message (skip for demo users)
+    if (mongooseConnected && isAuth) {
       await Message.create({ user_id: userId, session_id: chatId, role: 'user', content: message });
     }
 
-    // 3. Update Title (if new)
-    let count = 0;
-    if (mongooseConnected) {
-      count = await Message.countDocuments({ session_id: chatId });
+    // 3. Update Title (if new) (skip for demo users)
+    if (mongooseConnected && isAuth) {
+      const count = await Message.countDocuments({ session_id: chatId });
       if (count <= 2) {
         const newTitle = message.substring(0, 60);
         await ChatSession.updateOne({ id: chatId }, { $set: { title: newTitle, updated_at: new Date() } });
@@ -1243,8 +1262,8 @@ app.post("/chat", async (req, res) => {
       }
     }
 
-    // 7. Save Assistant Message
-    if (mongooseConnected) {
+    // 7. Save Assistant Message (skip for demo users)
+    if (mongooseConnected && isAuth) {
       await Message.create({ user_id: userId, session_id: chatId, role: 'assistant', content: aiResponse });
     }
 
@@ -1266,7 +1285,7 @@ app.post("/chat", async (req, res) => {
 // 6.1 COMPLIANCE CHAT ROUTE
 // ==========================================
 
-app.post("/compliance/chat", loginRequired, async (req, res) => {
+app.post("/compliance/chat", async (req, res) => {
   try {
     const { query } = req.body;
     
@@ -1402,7 +1421,7 @@ app.post("/compliance/chat", loginRequired, async (req, res) => {
  *   "disclaimer": string
  * }
  */
-app.post("/defender/query", loginRequired, async (req, res) => {
+app.post("/defender/query", async (req, res) => {
   try {
     const { query } = req.body;
     
@@ -2613,9 +2632,12 @@ app.get("/api/share/:shareId", async (req, res) => {
   }
 });
 
-app.post("/chat/create-report", loginRequired, async (req, res) => {
+app.post("/chat/create-report", async (req, res) => {
   let { company_name, session_id } = req.body;
-  const userId = req.user._id;
+  
+  // Safely resolve user ID (returns "demo-user" if not authenticated)
+  const userId = resolveUserId(req);
+  const isAuth = isAuthenticated(req);
 
   if (!company_name) return res.status(400).json({ error: "Company name is required" });
 
@@ -2670,9 +2692,9 @@ app.post("/chat/create-report", loginRequired, async (req, res) => {
     const downloadUrl = `${baseUrl}/reports/download/${reportId}`;
     const aiMessage = `✅ Your research report for **${company_name}** is ready!\n\n📄 [Download Report as PDF](${downloadUrl})`;
 
-    // Save report to database for portfolio
+    // Save report to database for portfolio (skip for demo users)
     let savedReport = null;
-    if (mongooseConnected) {
+    if (mongooseConnected && isAuth) {
       // Create or update PortfolioItem for this company.
       // We try to resolve an NSE symbol here, but if resolution fails, we use
       // the company_name (uppercase) as a fallback symbol to ensure PortfolioItem is always created.
@@ -2750,6 +2772,9 @@ app.post("/chat/create-report", loginRequired, async (req, res) => {
 
       await Message.create({ user_id: userId, session_id, role: 'user', content: `Generate report for ${company_name}` });
       await Message.create({ user_id: userId, session_id, role: 'assistant', content: aiMessage });
+    } else if (!session_id) {
+      // Generate session ID for demo users (not persisted)
+      session_id = uuidv4();
     }
 
     return res.json({
