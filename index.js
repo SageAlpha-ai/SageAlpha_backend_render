@@ -3124,6 +3124,199 @@ app.get("/reports/download/:id", async (req, res) => {
   }
 });
 
+// Send report via email endpoint (for demo/ad traffic)
+app.post("/report/send-email", async (req, res) => {
+  try {
+    const { email, reportId } = req.body;
+
+    // Validate input
+    if (!email || !reportId) {
+      return res.status(400).json({
+        success: false,
+        error: "Email and report ID are required"
+      });
+    }
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid email format"
+      });
+    }
+
+    // Sanitize report ID
+    const safeReportId = reportId.replace(/[^\w\-_]/g, "_");
+
+    console.log(`[SendEmail] Request to send report ${safeReportId} to ${email}`);
+
+    // Check if email service is configured
+    if (!isEmailConfigured) {
+      console.error("[SendEmail] Email service not configured");
+      return res.status(500).json({
+        success: false,
+        error: "Email service is not configured"
+      });
+    }
+
+    // Get HTML content from Azure Blob Storage
+    const htmlContent = await getHtmlFromBlob(safeReportId);
+
+    if (!htmlContent) {
+      console.error(`[SendEmail] HTML blob not found for report ID: ${safeReportId}`);
+      return res.status(404).json({
+        success: false,
+        error: "Report not found"
+      });
+    }
+
+    // Validate HTML size (reject > 1.5MB)
+    const sizeValidation = validateHtmlSize(htmlContent);
+    if (!sizeValidation.valid) {
+      console.error(`[SendEmail] HTML size validation failed: ${sizeValidation.error}`);
+      return res.status(400).json({
+        success: false,
+        error: "HTML content too large for PDF generation",
+        message: sizeValidation.error
+      });
+    }
+
+    // Log HTML size
+    console.log(`[SendEmail] HTML content size: ${sizeValidation.sizeBytes} bytes (${(sizeValidation.sizeBytes / 1024).toFixed(2)} KB)`);
+
+    // Convert HTML to PDF (reuse existing logic)
+    console.log(`[SendEmail] Converting HTML to PDF`);
+    const pdfBuffer = await convertHtmlToPdf(htmlContent);
+
+    console.log(`[SendEmail] PDF generated successfully (${pdfBuffer.length} bytes)`);
+
+    // Prepare email content
+    const emailSubject = "Your SageAlpha Equity Research Report";
+    const emailHtml = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      line-height: 1.6;
+      color: #333;
+      max-width: 600px;
+      margin: 0 auto;
+      padding: 20px;
+      background-color: #ffffff;
+    }
+    .header {
+      text-align: center;
+      padding: 20px 0;
+      border-bottom: 2px solid #0066cc;
+    }
+    .content {
+      padding: 24px 0;
+      font-size: 15px;
+    }
+    .highlight {
+      background: #f5f9ff;
+      padding: 12px 16px;
+      border-left: 4px solid #0066cc;
+      margin: 20px 0;
+      border-radius: 4px;
+    }
+    .footer {
+      margin-top: 30px;
+      padding-top: 20px;
+      border-top: 1px solid #eee;
+      font-size: 12px;
+      color: #666;
+      text-align: center;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="header">
+    <h1 style="color: #0066cc; margin: 0;">SageAlpha Research</h1>
+    <p style="margin: 6px 0 0; font-size: 13px; color: #666;">
+      Institutional-style Equity Research
+    </p>
+  </div>
+
+  <div class="content">
+    <p>Hello,</p>
+
+    <p>
+      Thank you for requesting an equity research report from <strong>SageAlpha</strong>.
+      We're pleased to share the detailed report you asked for.
+    </p>
+
+    <div class="highlight">
+      <p style="margin: 0;">
+        📄 <strong>Your equity research report is attached to this email as a PDF.</strong>
+      </p>
+    </div>
+
+    <p>
+      This report has been prepared to help you better understand the company's
+      business fundamentals, growth outlook, and key risks.
+    </p>
+
+    <p>
+      If you have any questions after reviewing the report or would like
+      insights on other companies or sectors, feel free to reach out — we're happy to help.
+    </p>
+
+    <p style="margin-top: 28px;">
+      Warm regards,<br>
+      <strong>The SageAlpha Research Team</strong>
+    </p>
+  </div>
+
+  <div class="footer">
+    <p>
+      SageAlpha.ai provides research and analysis for informational purposes only.
+      This content should not be considered financial advice.
+    </p>
+    <p style="margin-top: 10px; font-size: 11px; color: #999;">
+      This is an automated email. Please do not reply directly to this message.
+    </p>
+  </div>
+</body>
+</html>
+`;
+
+    // Send email with PDF attachment
+    await sendEmail({
+      to: email,
+      subject: emailSubject,
+      html: emailHtml,
+      attachments: [
+        {
+          filename: `SageAlpha_${safeReportId}.pdf`,
+          content: pdfBuffer
+        }
+      ]
+    });
+
+    console.log(`[SendEmail] Report sent successfully to ${email}`);
+
+    return res.json({
+      success: true,
+      message: "Report sent successfully"
+    });
+
+  } catch (err) {
+    console.error("[SendEmail] Endpoint Error:", err.message);
+    console.error("[SendEmail] Error stack:", err.stack);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to send report",
+      message: err.message
+    });
+  }
+});
+
 
 
 
