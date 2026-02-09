@@ -62,6 +62,7 @@ const Subscriber = require('./models/Subscriber');
 const UserPreference = require('./models/UserPreference');
 const ReportDelivery = require('./models/ReportDelivery');
 const SharedChat = require('./models/SharedChat');
+const UsageLimit = require('./models/UsageLimit');
 const axios = require("axios");
 const multer = require("multer");
 const { v4: uuidv4 } = require("uuid");
@@ -255,7 +256,8 @@ const corsOptions = {
     "Accept",
     "Origin",
     "Access-Control-Request-Method",
-    "Access-Control-Request-Headers"
+    "Access-Control-Request-Headers",
+    "x-demo-id"
   ],
   exposedHeaders: ["Authorization"],
   credentials: true,
@@ -279,7 +281,7 @@ app.use((req, res, next) => {
       res.header('Access-Control-Allow-Origin', origin);
       res.header('Access-Control-Allow-Credentials', 'true');
       res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
-      res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Access-Control-Request-Method, Access-Control-Request-Headers');
+      res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Access-Control-Request-Method, Access-Control-Request-Headers, x-demo-id');
       res.header('Access-Control-Max-Age', '86400');
       return res.status(200).end();
     }
@@ -485,6 +487,165 @@ function resolveUserId(req) {
 function isAuthenticated(req) {
   return !!req.user;
 }
+
+/**
+ * Resolve user identity for usage tracking
+ * Returns object with identifier and identifierType
+ * @param {Object} req - Express request object
+ * @returns {Object} { identifier: string, identifierType: 'user'|'demo' }
+ */
+function resolveUserIdentity(req) {
+  // If authenticated, use userId
+  if (req.user && req.user._id) {
+    return {
+      identifier: req.user._id.toString(),
+      identifierType: 'user'
+    };
+  }
+  
+  // For demo users, try demoId header first, then fall back to IP
+  const demoId = req.headers['x-demo-id'];
+  if (demoId) {
+    return {
+      identifier: demoId,
+      identifierType: 'demo'
+    };
+  }
+  
+  // Fall back to IP address
+  // req.ip is set by express with trust proxy enabled
+  const ip = req.ip || req.connection.remoteAddress || 'unknown';
+  return {
+    identifier: ip,
+    identifierType: 'demo'
+  };
+}
+
+/**
+ * Middleware to check and enforce usage limits for AI tools
+ * @param {string} aiType - Type of AI tool: 'chat', 'compliance', 'market', 'defender'
+ * @param {number} maxUsage - Maximum allowed usage (default: 5)
+ * @returns {Function} Express middleware
+ */
+function checkUsageLimit(aiType, maxUsage = 5) {
+  return async (req, res, next) => {
+    try {
+      // Skip usage limit check if database is not connected
+      if (!mongooseConnected) {
+        console.warn(`[UsageLimit] Database not connected, skipping usage limit check for ${aiType}`);
+        return next();
+      }
+
+      // Resolve user identity
+      const { identifier, identifierType } = resolveUserIdentity(req);
+
+      // Find or create usage record
+      let usageRecord = await UsageLimit.findOne({
+        identifier,
+        identifierType,
+        aiType
+      });
+
+      if (!usageRecord) {
+        // Create new usage record
+        usageRecord = await UsageLimit.create({
+          identifier,
+          identifierType,
+          aiType,
+          usageCount: 0,
+          lastUsedAt: new Date()
+        });
+      }
+
+      // Check if usage limit is reached
+      if (usageRecord.usageCount >= maxUsage) {
+        return res.status(403).json({
+          success: false,
+          code: "USAGE_LIMIT_REACHED",
+          message: "You have reached the free usage limit. Upgrade to continue using SageAlpha services."
+        });
+      }
+
+      // Increment usage count and update last used timestamp
+      usageRecord.usageCount += 1;
+      usageRecord.lastUsedAt = new Date();
+      await usageRecord.save();
+
+      // Attach usage info to request for potential logging/debugging
+      req.usageInfo = {
+        identifier,
+        identifierType,
+        aiType,
+        currentUsage: usageRecord.usageCount,
+        maxUsage
+      };
+
+      // Allow request to proceed
+      next();
+    } catch (error) {
+      console.error(`[UsageLimit] Error checking usage limit for ${aiType}:`, error);
+      // On error, allow request to proceed (fail open)
+      // This prevents usage limit system from breaking the app
+      next();
+    }
+  };
+}
+
+/**
+ * GET /usage/status
+ * Returns current usage counts for all AI tools
+ * Works for both authenticated and demo users
+ */
+app.get("/usage/status", async (req, res) => {
+  try {
+    // Skip if database is not connected
+    if (!mongooseConnected) {
+      return res.json({
+        chat: { usageCount: 0, maxUsage: 5 },
+        compliance: { usageCount: 0, maxUsage: 5 },
+        market: { usageCount: 0, maxUsage: 5 },
+        defender: { usageCount: 0, maxUsage: 5 }
+      });
+    }
+
+    // Resolve user identity
+    const { identifier, identifierType } = resolveUserIdentity(req);
+
+    // Fetch usage records for all AI types
+    const usageRecords = await UsageLimit.find({
+      identifier,
+      identifierType
+    });
+
+    // Create a map for easy lookup
+    const usageMap = {};
+    usageRecords.forEach(record => {
+      usageMap[record.aiType] = {
+        usageCount: record.usageCount,
+        maxUsage: 5,
+        lastUsedAt: record.lastUsedAt
+      };
+    });
+
+    // Return usage status for all AI tools (default to 0 if not found)
+    return res.json({
+      chat: usageMap.chat || { usageCount: 0, maxUsage: 5 },
+      compliance: usageMap.compliance || { usageCount: 0, maxUsage: 5 },
+      market: usageMap.market || { usageCount: 0, maxUsage: 5 },
+      defender: usageMap.defender || { usageCount: 0, maxUsage: 5 }
+    });
+  } catch (error) {
+    console.error("[UsageStatus] Error fetching usage status:", error);
+    // Return default values on error
+    return res.json({
+      chat: { usageCount: 0, maxUsage: 5 },
+      compliance: { usageCount: 0, maxUsage: 5 },
+      market: { usageCount: 0, maxUsage: 5 },
+      defender: { usageCount: 0, maxUsage: 5 }
+    });
+  }
+});
+
 // ==========================================
 // 4. AUTH & USER ROUTES
 // ==========================================
@@ -1172,7 +1333,7 @@ function getBaseUrl(req) {
 // 6. CHAT ROUTES
 // ==========================================
 
-app.post("/chat", async (req, res) => {
+app.post("/chat", checkUsageLimit('chat'), async (req, res) => {
   try {
     const { message, session_id, top_k } = req.body;
     if (!message) return res.status(400).json({ error: "Empty message" });
@@ -1285,7 +1446,7 @@ app.post("/chat", async (req, res) => {
 // 6.1 COMPLIANCE CHAT ROUTE
 // ==========================================
 
-app.post("/compliance/chat", async (req, res) => {
+app.post("/compliance/chat", checkUsageLimit('compliance'), async (req, res) => {
   try {
     const { query } = req.body;
     
@@ -1421,7 +1582,7 @@ app.post("/compliance/chat", async (req, res) => {
  *   "disclaimer": string
  * }
  */
-app.post("/defender/query", async (req, res) => {
+app.post("/defender/query", checkUsageLimit('defender'), async (req, res) => {
   try {
     const { query } = req.body;
     
@@ -3217,13 +3378,7 @@ app.post("/report/send-email", async (req, res) => {
       padding: 24px 0;
       font-size: 15px;
     }
-    .highlight {
-      background: #f5f9ff;
-      padding: 12px 16px;
-      border-left: 4px solid #0066cc;
-      margin: 20px 0;
-      border-radius: 4px;
-    }
+   
     .footer {
       margin-top: 30px;
       padding-top: 20px;
@@ -3251,9 +3406,9 @@ app.post("/report/send-email", async (req, res) => {
       We're pleased to share the detailed report you asked for.
     </p>
 
-    <div class="highlight">
+    <div>
       <p style="margin: 0;">
-        📄 <strong>Your equity research report is attached to this email as a PDF.</strong>
+        Your equity research report is attached to this email as a PDF.
       </p>
     </div>
 
@@ -4142,7 +4297,7 @@ app.post("/api/market-intelligence", loginRequired, async (req, res) => {
  *   "max_results": 20        // optional, default: 20
  * }
  */
-app.post("/api/market-chatter", loginRequired, async (req, res) => {
+app.post("/api/market-chatter", loginRequired, checkUsageLimit('market'), async (req, res) => {
   try {
     const { query, lookback_hours, max_results } = req.body;
 
