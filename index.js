@@ -527,7 +527,7 @@ function resolveUserIdentity(req) {
  * @param {number} maxUsage - Maximum allowed usage (default: 5)
  * @returns {Function} Express middleware
  */
-function checkUsageLimit(aiType, maxUsage = 50) {
+function checkUsageLimit(aiType, maxUsage = 5000) {
   return async (req, res, next) => {
     try {
       // Skip usage limit check if database is not connected
