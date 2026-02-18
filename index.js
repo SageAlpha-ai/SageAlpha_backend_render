@@ -527,7 +527,7 @@ function resolveUserIdentity(req) {
  * @param {number} maxUsage - Maximum allowed usage (default: 5)
  * @returns {Function} Express middleware
  */
-function checkUsageLimit(aiType, maxUsage = 50) {
+function checkUsageLimit(aiType, maxUsage = 5000) {
   return async (req, res, next) => {
     try {
       // Skip usage limit check if database is not connected
@@ -2793,7 +2793,7 @@ app.get("/api/share/:shareId", async (req, res) => {
   }
 });
 
-app.post("/chat/create-report", async (req, res) => {
+app.post("/chat/create-report", checkUsageLimit('chat'), async (req, res) => {
   let { company_name, session_id } = req.body;
   
   // Safely resolve user ID (returns "demo-user" if not authenticated)
