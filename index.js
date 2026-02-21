@@ -63,6 +63,9 @@ const UserPreference = require('./models/UserPreference');
 const ReportDelivery = require('./models/ReportDelivery');
 const SharedChat = require('./models/SharedChat');
 const UsageLimit = require('./models/UsageLimit');
+const Payment = require('./models/Payment');
+const razorpay = require('./utils/razorpay');
+const crypto = require('crypto');
 const axios = require("axios");
 const multer = require("multer");
 const { v4: uuidv4 } = require("uuid");
@@ -527,7 +530,7 @@ function resolveUserIdentity(req) {
  * @param {number} maxUsage - Maximum allowed usage (default: 5)
  * @returns {Function} Express middleware
  */
-function checkUsageLimit(aiType, maxUsage = 5000) {
+function checkUsageLimit(aiType, maxUsage = 5) {
   return async (req, res, next) => {
     try {
       // Skip usage limit check if database is not connected
@@ -2565,7 +2568,11 @@ app.get("/user", loginRequired, (req, res) => {
     display_name: req.user.display_name,
     avatar: req.user.avatar || null,
     avatar_url: req.user.avatar || null,
-    authProvider: req.user.authProvider || 'local'
+    authProvider: req.user.authProvider || 'local',
+    // Subscription fields (used by frontend Profile page)
+    subscription: req.user.subscription || "FREE",
+    subscriptionStatus: req.user.subscriptionStatus || "active",
+    reportsLimit: typeof req.user.reportsLimit === "number" ? req.user.reportsLimit : 5
   });
 });
 
@@ -4326,6 +4333,189 @@ app.post("/api/market-chatter", loginRequired, checkUsageLimit('market'), async 
     return res.status(502).json({
       status: "error",
       message: "Market chatter service temporarily unavailable"
+    });
+  }
+});
+
+// ==========================================
+// 8. PAYMENT ROUTES (RAZORPAY)
+// ==========================================
+
+/**
+ * POST /api/payment/create-order
+ * Creates a Razorpay order for payment
+ * Requires authentication
+ */
+  app.post("/api/payment/create-order", loginRequired, async (req, res) => {
+  try {
+    const { amount, plan } = req.body;
+
+    // Validate input
+    if (!amount || !plan) {
+      return res.status(400).json({ error: "Amount and plan are required" });
+    }
+
+    // Validate plan
+    if (!['PLUS', 'PRO'].includes(plan)) {
+      return res.status(400).json({ error: "Invalid plan. Must be PLUS or PRO" });
+    }
+
+    // Validate amount matches plan
+    const planAmounts = {
+      'PLUS': 15000,
+      'PRO': 45000
+    };
+
+    if (amount !== planAmounts[plan]) {
+      return res.status(400).json({ 
+        error: `Amount mismatch. Expected ₹${planAmounts[plan]} for ${plan} plan` 
+      });
+    }
+
+    // Create Razorpay order
+    // Receipt must be max 40 characters (Razorpay requirement)
+    const userIdShort = req.user._id.toString().slice(-8); // Last 8 chars of user ID
+    const timestamp = Date.now().toString().slice(-10); // Last 10 digits of timestamp
+    const receipt = `RCP_${timestamp}_${userIdShort}`; // Format: RCP_1234567890_12345678 (max 25 chars)
+    
+    const options = {
+      amount: amount * 100, // Convert to paise
+      currency: "INR",
+      receipt: receipt,
+    };
+
+    const order = await razorpay.orders.create(options);
+
+    // Store payment record in DB (status: created)
+    await Payment.create({
+      userId: req.user._id,
+      plan: plan,
+      amount: amount,
+      orderId: order.id,
+      status: "created",
+      // optional metadata
+      currency: "INR",
+      receipt: options.receipt,
+    });
+
+    res.json({ order, plan });
+
+  } catch (error) {
+    console.error("[Payment] Create order error:", error);
+    res.status(500).json({ error: error.message || "Failed to create order" });
+  }
+});
+
+/**
+ * POST /api/payment/verify
+ * Verifies Razorpay payment signature and updates user subscription
+ * Requires authentication
+ */
+app.post("/api/payment/verify", loginRequired, async (req, res) => {
+  try {
+    const {
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+      plan,
+      userId
+    } = req.body;
+
+    // Validate input
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !plan) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Missing required payment parameters" 
+      });
+    }
+
+    // Verify userId matches authenticated user
+    if (userId !== req.user._id.toString()) {
+      return res.status(403).json({ 
+        success: false, 
+        message: "User ID mismatch" 
+      });
+    }
+
+    // Find payment record by orderId
+    const paymentRecord = await Payment.findOne({ orderId: razorpay_order_id });
+    if (!paymentRecord) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "Order not found" 
+      });
+    }
+
+    // Verify payment belongs to user
+    if (paymentRecord.userId.toString() !== userId) {
+      return res.status(403).json({ 
+        success: false, 
+        message: "Payment does not belong to user" 
+      });
+    }
+
+    // Verify signature
+    const body = razorpay_order_id + "|" + razorpay_payment_id;
+    const expectedSignature = crypto
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+      .update(body)
+      .digest("hex");
+
+    if (expectedSignature !== razorpay_signature) {
+      // Update payment record as failed
+      await Payment.findOneAndUpdate(
+        { orderId: razorpay_order_id },
+        {
+          status: "failed",
+        }
+      );
+
+      return res.status(400).json({ 
+        success: false, 
+        message: "Invalid payment signature" 
+      });
+    }
+
+    // Verify plan matches
+    if (paymentRecord.plan !== plan) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Plan mismatch" 
+      });
+    }
+
+    // Update payment record to paid
+    await Payment.findOneAndUpdate(
+      { orderId: razorpay_order_id },
+      {
+        paymentId: razorpay_payment_id,
+        signature: razorpay_signature,
+        status: "paid",
+      }
+    );
+
+    // Determine reports limit based on plan
+    const reportsLimit = plan === "PLUS" ? 50 : 9999;
+
+    // Update user subscription
+    await User.findByIdAndUpdate(userId, {
+      subscription: plan,
+      subscriptionStatus: "active",
+      reportsLimit: reportsLimit
+    });
+
+    res.json({ 
+      success: true, 
+      message: "Payment verified and subscription activated",
+      plan: plan,
+      reportsLimit: reportsLimit
+    });
+
+  } catch (error) {
+    console.error("[Payment] Verify error:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: error.message || "Payment verification failed" 
     });
   }
 });

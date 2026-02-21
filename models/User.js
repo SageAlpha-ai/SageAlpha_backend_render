@@ -11,7 +11,10 @@ const UserSchema = new mongoose.Schema({
   is_active: { type: Boolean, default: true },
   is_waitlist: { type: Boolean, default: false },
   otp_code: { type: String, default: null },
-otp_expires: { type: Date, default: null }
+  otp_expires: { type: Date, default: null },
+  subscription: { type: String, enum: ['FREE', 'PLUS', 'PRO'], default: 'FREE' },
+  subscriptionStatus: { type: String, enum: ['active', 'inactive', 'expired'], default: 'active' },
+  reportsLimit: { type: Number, default: 5 }
 
 }, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } });
 
