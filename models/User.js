@@ -14,7 +14,9 @@ const UserSchema = new mongoose.Schema({
   otp_expires: { type: Date, default: null },
   subscription: { type: String, enum: ['FREE', 'PLUS', 'PRO'], default: 'FREE' },
   subscriptionStatus: { type: String, enum: ['active', 'inactive', 'expired'], default: 'active' },
-  reportsLimit: { type: Number, default: 5 }
+  reportsLimit: { type: Number, default: 5 },
+  planStartDate: { type: Date, default: null },
+  planEndDate: { type: Date, default: null }
 
 }, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } });
 

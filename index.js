@@ -174,9 +174,22 @@ if (!MONGO_URL) {
 
 let mongooseConnected = false;
 if (MONGO_URL) {
-  mongoose.connect(MONGO_URL).then(() => {
+  mongoose.connect(MONGO_URL).then(async () => {
     mongooseConnected = true;
     console.log('[DB] Connected to MongoDB');
+    
+    // Remove old unique index on paymentId (if it exists)
+    // This fixes E11000 duplicate key error when multiple orders have paymentId: null
+    try {
+      await mongoose.connection.collection("payments").dropIndex("paymentId_1").catch(() => {
+        // Index doesn't exist or already dropped - that's fine
+      });
+      console.log('[DB] Cleaned up old paymentId unique index');
+    } catch (error) {
+      // Ignore errors - index may not exist
+      console.log('[DB] No old paymentId index to clean up (or already cleaned)');
+    }
+    
     SeedDemoUsersMR().catch(e => console.error('[DB] Seed error:', e.message));
   }).catch((e) => {
     console.error('[DB] MongoDB connect failed:', e && e.message);
@@ -525,12 +538,11 @@ function resolveUserIdentity(req) {
 }
 
 /**
- 
+ * Subscription-aware usage limit middleware
  * @param {string} aiType - Type of AI tool: 'chat', 'compliance', 'market', 'defender'
- * @param {number} maxUsage - Maximum allowed usage (default: 5)
  * @returns {Function} Express middleware
  */
-function checkUsageLimit(aiType, maxUsage = 5) {
+function checkUsageLimit(aiType) {
   return async (req, res, next) => {
     try {
       // Skip usage limit check if database is not connected
@@ -539,8 +551,65 @@ function checkUsageLimit(aiType, maxUsage = 5) {
         return next();
       }
 
-      // Resolve user identity
-      const { identifier, identifierType } = resolveUserIdentity(req);
+      let identifier;
+      let identifierType;
+      let allowedLimit;
+      let user = null;
+
+      // Check if user is authenticated
+      if (req.user && req.user._id) {
+        // Authenticated user - fetch from database
+        user = await User.findById(req.user._id);
+        
+        if (!user) {
+          return res.status(401).json({
+            success: false,
+            message: "User not found"
+          });
+        }
+
+        // Check if plan has expired and auto-downgrade
+        if (user.planEndDate && new Date(user.planEndDate) < new Date()) {
+          user.subscription = "FREE";
+          user.subscriptionStatus = "expired";
+          user.reportsLimit = 5;
+          await user.save();
+        }
+
+        // Determine limit based on subscription
+        if (user.subscription === "PRO") {
+          // PRO users have unlimited access
+          req.usageInfo = {
+            identifier: req.user._id.toString(),
+            identifierType: "user",
+            aiType,
+            currentUsage: 0,
+            maxUsage: "unlimited",
+            subscription: "PRO"
+          };
+          return next();
+        }
+
+        // Check subscription status
+        if (user.subscriptionStatus !== "active") {
+          // Expired or inactive - treat as FREE
+          allowedLimit = user.reportsLimit || 5;
+        } else if (user.subscription === "PLUS") {
+          allowedLimit = user.reportsLimit || 50;
+        } else {
+          // FREE plan
+          allowedLimit = user.reportsLimit || 5;
+        }
+
+        identifier = req.user._id.toString();
+        identifierType = "user";
+      } else {
+        // Demo/unauthenticated user - use IP-based tracking
+        const { identifier: ipIdentifier, identifierType: ipType } = resolveUserIdentity(req);
+        identifier = ipIdentifier;
+        identifierType = ipType;
+        allowedLimit = 5; // Default for demo users
+      }
 
       // Find or create usage record
       let usageRecord = await UsageLimit.findOne({
@@ -561,11 +630,16 @@ function checkUsageLimit(aiType, maxUsage = 5) {
       }
 
       // Check if usage limit is reached
-      if (usageRecord.usageCount >= maxUsage) {
+      if (usageRecord.usageCount >= allowedLimit) {
         return res.status(403).json({
           success: false,
           code: "USAGE_LIMIT_REACHED",
-          message: "You have reached the free usage limit. Upgrade to continue using SageAlpha services."
+          message: user 
+            ? `You have reached your ${user.subscription} plan usage limit (${allowedLimit}). ${user.subscription === "FREE" ? "Upgrade to continue using SageAlpha services." : "Your plan will renew next month."}`
+            : "You have reached the free usage limit. Please sign up to continue using SageAlpha services.",
+          subscription: user?.subscription || "FREE",
+          currentUsage: usageRecord.usageCount,
+          maxUsage: allowedLimit
         });
       }
 
@@ -580,7 +654,8 @@ function checkUsageLimit(aiType, maxUsage = 5) {
         identifierType,
         aiType,
         currentUsage: usageRecord.usageCount,
-        maxUsage
+        maxUsage: allowedLimit,
+        subscription: user?.subscription || "FREE"
       };
 
       // Allow request to proceed
@@ -4417,23 +4492,14 @@ app.post("/api/payment/verify", loginRequired, async (req, res) => {
       razorpay_order_id,
       razorpay_payment_id,
       razorpay_signature,
-      plan,
-      userId
+      plan
     } = req.body;
 
-    // Validate input
+    // Validate input (do NOT require userId from frontend - security risk)
     if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !plan) {
       return res.status(400).json({ 
         success: false, 
         message: "Missing required payment parameters" 
-      });
-    }
-
-    // Verify userId matches authenticated user
-    if (userId !== req.user._id.toString()) {
-      return res.status(403).json({ 
-        success: false, 
-        message: "User ID mismatch" 
       });
     }
 
@@ -4446,11 +4512,14 @@ app.post("/api/payment/verify", loginRequired, async (req, res) => {
       });
     }
 
-    // Verify payment belongs to user
-    if (paymentRecord.userId.toString() !== userId) {
+    // Get userId from payment record (secure - not from frontend)
+    const userId = paymentRecord.userId;
+
+    // Verify payment belongs to authenticated user (security check)
+    if (paymentRecord.userId.toString() !== req.user._id.toString()) {
       return res.status(403).json({ 
         success: false, 
-        message: "Payment does not belong to user" 
+        message: "Payment does not belong to authenticated user" 
       });
     }
 
@@ -4484,7 +4553,24 @@ app.post("/api/payment/verify", loginRequired, async (req, res) => {
       });
     }
 
-    // Update payment record to paid
+    // Calculate plan dates (1 month subscription)
+    const startDate = new Date();
+    const endDate = new Date();
+    endDate.setMonth(endDate.getMonth() + 1);
+
+    // Determine reports limit based on plan
+    const reportsLimit = plan === "PLUS" ? 50 : 9999;
+
+    // Update user subscription with plan dates
+    await User.findByIdAndUpdate(userId, {
+      subscription: plan,
+      subscriptionStatus: "active",
+      reportsLimit: reportsLimit,
+      planStartDate: startDate,
+      planEndDate: endDate
+    });
+
+    // Update payment record to paid (after user update succeeds)
     await Payment.findOneAndUpdate(
       { orderId: razorpay_order_id },
       {
@@ -4493,16 +4579,6 @@ app.post("/api/payment/verify", loginRequired, async (req, res) => {
         status: "paid",
       }
     );
-
-    // Determine reports limit based on plan
-    const reportsLimit = plan === "PLUS" ? 50 : 9999;
-
-    // Update user subscription
-    await User.findByIdAndUpdate(userId, {
-      subscription: plan,
-      subscriptionStatus: "active",
-      reportsLimit: reportsLimit
-    });
 
     res.json({ 
       success: true, 
