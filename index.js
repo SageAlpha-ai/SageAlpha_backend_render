@@ -525,7 +525,7 @@ function resolveUserIdentity(req) {
 }
 
 /**
- * Middleware to check and enforce usage limits for AI tools
+ 
  * @param {string} aiType - Type of AI tool: 'chat', 'compliance', 'market', 'defender'
  * @param {number} maxUsage - Maximum allowed usage (default: 5)
  * @returns {Function} Express middleware
